@@ -50,10 +50,9 @@ You need a Rust toolchain (1.85 or newer) and FFmpeg (`ffmpeg` and
 cargo install --git https://github.com/tuxxy/spectro
 ```
 
-On Linux, building needs the X11 and xkbcommon headers (for example
-`libx11-dev libxkbcommon-dev pkg-config` on Debian/Ubuntu). The file dialogs
-use `zenity` or `kdialog`; on macOS they use `osascript`, on Windows
-PowerShell.
+On Linux, X11 and Wayland libraries are loaded at run time, so building
+needs no system headers. The file dialogs use `zenity` or `kdialog`; on
+macOS they use `osascript`, on Windows PowerShell.
 
 ## Use
 
