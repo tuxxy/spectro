@@ -1,0 +1,32 @@
+[workspace]
+members = ["crates/spectro-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tuxxy/spectro"
+rust-version = "1.85"
+
+[package]
+name = "spectro"
+description = "Acoustic spectrum analyser: a minimal, safe Rust clone of Spek"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+spectro-core = { path = "crates/spectro-core" }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev.package.spectro-core]
+opt-level = 3
