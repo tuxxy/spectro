@@ -63,3 +63,23 @@ pub fn save(name: &str) -> Option<PathBuf> {
         })
     }
 }
+
+/// Shows `path` in the file manager.
+pub fn reveal(path: &std::path::Path) {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg("-R").arg(path);
+        c
+    } else if cfg!(windows) {
+        let mut arg = std::ffi::OsString::from("/select,");
+        arg.push(path.as_os_str());
+        let mut c = Command::new("explorer");
+        c.arg(arg);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(path.parent().unwrap_or(path));
+        c
+    };
+    let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}

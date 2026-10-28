@@ -8,8 +8,10 @@
 mod dialogs;
 mod gui;
 mod media;
+mod menu;
 mod pipeline;
 mod player;
+mod recent;
 mod settings;
 
 use std::path::{Path, PathBuf};

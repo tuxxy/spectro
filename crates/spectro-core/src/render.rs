@@ -126,7 +126,7 @@ pub struct View<'a> {
     /// Centred message over the plot; a first line, then dimmer lines.
     pub message: Option<&'a str>,
     /// Panel listing `(key, description)` rows, e.g. help or settings.
-    pub panel: Option<(&'a str, &'a [(String, String)])>,
+    pub panel: Option<Panel<'a>>,
     /// Version string for the about panel and the like.
     pub version: &'a str,
     /// Let loud components bloom.
@@ -136,6 +136,23 @@ pub struct View<'a> {
     pub cursor: Option<(f32, f32)>,
     /// A selected time and frequency region, e.g. for looped playback.
     pub selection: Option<Selection>,
+}
+
+/// A card over the picture: help, settings or about.
+#[derive(Clone, Copy)]
+pub struct Panel<'a> {
+    pub title: &'a str,
+    pub sections: &'a [Section],
+    /// Small print at the bottom, e.g. how to close the card.
+    pub footer: &'a str,
+}
+
+/// A titled group of `(keys, description)` rows. Keys separated by two
+/// spaces are drawn as separate keycaps; an empty key leaves only text.
+#[derive(Clone, Debug, Default)]
+pub struct Section {
+    pub heading: String,
+    pub rows: Vec<(String, String)>,
 }
 
 /// A region of the spectrogram in seconds and hertz.
@@ -414,8 +431,8 @@ impl Renderer {
         if let Some(msg) = v.message {
             self.message(c, &l, msg);
         }
-        if let Some((title, rows)) = v.panel {
-            self.panel(c, &l, title, rows);
+        if let Some(panel) = v.panel {
+            self.panel(c, &l, panel);
         }
     }
 
@@ -878,36 +895,127 @@ impl Renderer {
         }
     }
 
-    fn panel(&mut self, c: &mut Canvas, l: &Layout, title: &str, rows: &[(String, String)]) {
+    /// Width of a row's keycaps.
+    fn keys_width(&self, l: &Layout, keys: &str) -> f32 {
+        let (px, pad, gap) = (11.5 * l.s, 7.0 * l.s, 5.0 * l.s);
+        keys.split("  ")
+            .filter(|k| !k.is_empty())
+            .map(|k| self.text.width(Weight::Semibold, px, k) + 2.0 * pad + gap)
+            .sum::<f32>()
+    }
+
+    fn keycaps(&mut self, c: &mut Canvas, l: &Layout, keys: &str, (x, y): (f32, f32), row_h: f32) {
+        let (px, pad, gap) = (11.5 * l.s, 7.0 * l.s, 5.0 * l.s);
+        let h = 20.0 * l.s;
+        let lh = self.text.line_height(Weight::Semibold, px);
+        let top = y + (row_h - h) / 2.0;
+        let mut x = x;
+        for k in keys.split("  ").filter(|k| !k.is_empty()) {
+            let w = self.text.width(Weight::Semibold, px, k) + 2.0 * pad;
+            let rr = RoundRect { x, y: top, w, h, r: 5.0 * l.s };
+            c.fill_round(rr, WHITE, 0.07);
+            c.stroke_round(rr, l.hair, WHITE, 0.16);
+            self.text.draw(c, Weight::Semibold, px, (x + pad, top + (h - lh) / 2.0), TEXT, k);
+            x += w + gap;
+        }
+    }
+
+    fn panel(&mut self, c: &mut Canvas, l: &Layout, panel: Panel) {
         let s = l.s;
         let size = 13.0 * s;
-        let lh = self.text.line_height(Weight::Regular, size) * 1.45;
-        let key_w = rows.iter().map(|(k, _)| self.text.width(Weight::Semibold, size, k)).fold(0.0, f32::max);
-        let val_w = rows.iter().map(|(_, d)| self.text.width(Weight::Regular, size, d)).fold(0.0, f32::max);
-        let title_px = 16.0 * s;
-        let title_h = self.text.line_height(Weight::Semibold, title_px) * 1.8;
-        let pad = 24.0 * s;
-        let pw =
-            (key_w + val_w + 18.0 * s + 2.0 * pad).max(self.text.width(Weight::Semibold, title_px, title) + 2.0 * pad);
-        let ph = title_h + lh * rows.len() as f32 + 2.0 * pad - 6.0 * s;
+        let row_h = 27.0 * s;
+        let head_px = 11.0 * s;
+        let head_h = 30.0 * s;
+        let title_px = 18.0 * s;
+        let title_h = self.text.line_height(Weight::Semibold, title_px) + 14.0 * s;
+        let footer_px = 11.5 * s;
+        let footer_h = if panel.footer.is_empty() { 0.0 } else { 34.0 * s };
+        let pad = 28.0 * s;
+        let col_gap = 36.0 * s;
         let (w, h) = (c.width() as f32, c.height() as f32);
+
+        let section_h =
+            |sec: &Section| (if sec.heading.is_empty() { 0.0 } else { head_h }) + row_h * sec.rows.len() as f32;
+        let total: f32 = panel.sections.iter().map(section_h).sum();
+        let room = (h - 2.0 * pad - title_h - footer_h - 48.0 * s).max(row_h);
+        // Split the sections into as few columns as fit, balancing heights.
+        let mut columns: Vec<Vec<&Section>> = Vec::new();
+        let ncols = (1..=3).find(|&n| total / n as f32 <= room).unwrap_or(3).min(panel.sections.len().max(1));
+        let target = total / ncols as f32;
+        let mut cur: Vec<&Section> = Vec::new();
+        let mut acc = 0.0;
+        for sec in panel.sections {
+            let sh = section_h(sec);
+            if !cur.is_empty() && columns.len() + 1 < ncols && acc + sh / 2.0 > target {
+                columns.push(core::mem::take(&mut cur));
+                acc = 0.0;
+            }
+            acc += sh;
+            cur.push(sec);
+        }
+        columns.push(cur);
+
+        // Per column: the key width, and the full width. Sections without
+        // any keys start their text at the left edge.
+        let key_gap = 14.0 * s;
+        let has_keys = |sec: &Section| sec.rows.iter().any(|(k, _)| !k.is_empty());
+        let widths: Vec<(f32, f32)> = columns
+            .iter()
+            .map(|col| {
+                let kw = col.iter().flat_map(|sec| &sec.rows).map(|(k, _)| self.keys_width(l, k)).fold(0.0, f32::max);
+                let mut full: f32 = 0.0;
+                for sec in col {
+                    full = full.max(self.text.width(Weight::Semibold, head_px, &sec.heading.to_uppercase()));
+                    let indent = if has_keys(sec) { kw + key_gap } else { 0.0 };
+                    for (_, d) in &sec.rows {
+                        full = full.max(indent + self.text.width(Weight::Regular, size, d));
+                    }
+                }
+                (kw, full)
+            })
+            .collect();
+        let col_h = columns.iter().map(|col| col.iter().map(|sec| section_h(sec)).sum::<f32>()).fold(0.0, f32::max);
+        let content_w: f32 = widths.iter().map(|(_, full)| full).sum::<f32>() + col_gap * (columns.len() - 1) as f32;
+        let pw = (content_w + 2.0 * pad).max(self.text.width(Weight::Semibold, title_px, panel.title) + 2.0 * pad);
+        let ph = pad + title_h + col_h + footer_h + pad - 8.0 * s;
         let px = ((w - pw) / 2.0).max(0.0);
         let py = ((h - ph) / 2.0).max(0.0);
-        c.fill(0, 0, c.width() as i64, c.height() as i64, 0x000000, 0.5);
+
+        c.fill(0, 0, c.width() as i64, c.height() as i64, 0x000000, 0.55);
         for k in 1..=6 {
             let e = k as f32 * 3.0 * s;
-            let rr = RoundRect { x: px - e, y: py - e + 6.0 * s, w: pw + 2.0 * e, h: ph + 2.0 * e, r: 14.0 * s + e };
+            let rr = RoundRect { x: px - e, y: py - e + 6.0 * s, w: pw + 2.0 * e, h: ph + 2.0 * e, r: 16.0 * s + e };
             c.fill_round(rr, 0x000000, 0.07);
         }
-        let card = RoundRect { x: px, y: py, w: pw, h: ph, r: 14.0 * s };
+        let card = RoundRect { x: px, y: py, w: pw, h: ph, r: 16.0 * s };
         c.fill_round(card, CARD, 1.0);
         c.stroke_round(card, l.hair, WHITE, 0.09);
-        self.text.draw(c, Weight::Semibold, title_px, (px + pad, py + pad - 4.0 * s), TEXT, title);
-        let mut y = py + pad - 4.0 * s + title_h;
-        for (k, d) in rows {
-            self.text.draw(c, Weight::Semibold, size, (px + pad, y), TEXT, k);
-            self.text.draw(c, Weight::Regular, size, (px + pad + key_w + 18.0 * s, y), TEXT_DIM, d);
-            y += lh;
+        self.text.draw(c, Weight::Semibold, title_px, (px + pad, py + pad - 4.0 * s), TEXT, panel.title);
+
+        let lh = self.text.line_height(Weight::Regular, size);
+        let mut x = px + pad;
+        for (col, (kw, full)) in columns.iter().zip(&widths) {
+            let mut y = py + pad + title_h;
+            for sec in col {
+                if !sec.heading.is_empty() {
+                    let hy = y + head_h - self.text.line_height(Weight::Semibold, head_px) - 8.0 * s;
+                    self.text.draw(c, Weight::Semibold, head_px, (x, hy), TEXT_FAINT, &sec.heading.to_uppercase());
+                    y += head_h;
+                }
+                let indent = if has_keys(sec) { kw + key_gap } else { 0.0 };
+                for (k, d) in &sec.rows {
+                    self.keycaps(c, l, k, (x, y), row_h);
+                    let dx = x + indent;
+                    self.text.draw(c, Weight::Regular, size, (dx, y + (row_h - lh) / 2.0), TEXT_DIM, d);
+                    y += row_h;
+                }
+            }
+            x += full + col_gap;
+        }
+        if footer_h > 0.0 {
+            let fw = self.text.width(Weight::Regular, footer_px, panel.footer);
+            let fy = py + ph - pad + 8.0 * s - self.text.line_height(Weight::Regular, footer_px);
+            self.text.draw(c, Weight::Regular, footer_px, (px + (pw - fw) / 2.0, fy), TEXT_FAINT, panel.footer);
         }
     }
 }

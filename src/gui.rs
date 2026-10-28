@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use spectro_core::canvas::Canvas;
-use spectro_core::render::{Axes, Renderer, Selection, plot_rect};
+use spectro_core::render::{Axes, Panel as RenderPanel, Renderer, Section, Selection, plot_rect};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -15,8 +15,10 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::media::{self, Stream};
+use crate::menu::{Action, MenuBar, MenuState};
 use crate::pipeline::{Job, Request};
 use crate::player::{Player, Region};
+use crate::recent;
 use crate::settings::Settings;
 use crate::{VERSION, dialogs};
 
@@ -30,6 +32,9 @@ pub enum UserEvent {
     Progress,
     Open(PathBuf),
     Save(PathBuf),
+    /// A menu item's id (menus are native on macOS only).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Menu(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -68,6 +73,8 @@ struct App {
     drag: Option<(f32, f32)>,
     selection: Option<Region>,
     player: Option<Player>,
+    menu: Option<MenuBar>,
+    recent: Vec<PathBuf>,
 }
 
 pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: usize) -> Result<(), String> {
@@ -92,6 +99,8 @@ pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: us
         drag: None,
         selection: None,
         player: None,
+        menu: None,
+        recent: recent::load(),
     };
     if let Some(f) = file {
         app.load(f, stream, channel);
@@ -110,6 +119,10 @@ impl App {
 
     fn load(&mut self, path: PathBuf, stream: usize, channel: usize) {
         self.streams = media::probe(&path);
+        if self.streams.is_ok() {
+            recent::add(&mut self.recent, &path);
+            recent::save(&self.recent);
+        }
         self.path = Some(path);
         self.stream = stream;
         self.channel = channel;
@@ -121,6 +134,7 @@ impl App {
         self.status = None;
         self.clear_selection();
         self.restart();
+        self.sync_menu();
         if let Some(g) = &self.gfx {
             g.window.set_title(&self.title());
         }
@@ -191,6 +205,7 @@ impl App {
                     self.selection = region;
                     self.play();
                 }
+                self.sync_menu();
                 self.redraw_cursor();
             }
         }
@@ -263,7 +278,10 @@ impl App {
 
     fn message(&self) -> Option<String> {
         if self.path.is_none() {
-            return Some(format!("Drop an audio file here\nor press {}-O to open one", command_key()));
+            return Some(format!(
+                "Drop an audio file here\nor press {}-O to open one\nF1 shows everything spectro can do",
+                command_key()
+            ));
         }
         if let Some(s) = &self.status {
             return Some(s.clone());
@@ -272,60 +290,112 @@ impl App {
         job_error.or_else(|| self.streams.as_ref().err().cloned())
     }
 
-    fn panel_rows(&self) -> Option<(&'static str, Vec<(String, String)>)> {
+    /// The open card's title and sections.
+    fn panel_content(&self) -> Option<(&'static str, Vec<Section>)> {
         let cmd = command_key();
         let row = |k: &str, d: &str| (k.to_string(), d.to_string());
+        let section = |heading: &str, rows: Vec<(String, String)>| Section { heading: heading.into(), rows };
+        let s = &self.settings;
         match self.panel {
             Panel::None => None,
-            Panel::Help => Some((
-                "Keyboard",
-                vec![
-                    row(&format!("{cmd}-O"), "Open a file (or drop one on the window)"),
-                    row(&format!("{cmd}-S"), "Save the picture as PNG"),
-                    row(&format!("{cmd}-E"), "Settings"),
-                    row("F1 / Shift-F1", "This help / About"),
-                    row("c  C", "Next / previous channel"),
-                    row("s  S", "Next / previous stream"),
-                    row("p  P", "Next / previous palette"),
-                    row("f  F", "Next / previous window function"),
-                    row("w  W", "Larger / smaller window"),
-                    row("u  U", "Raise / lower the upper limit"),
-                    row("l  L", "Raise / lower the lower limit"),
-                    row("y  Y", "Next / previous frequency scale"),
-                    row("g", "Glow on loud components"),
-                    row("Drag", "Select a region and loop it, filtered to its band"),
-                    row("Space", "Stop / restart the loop"),
-                    row("Click", "Clear the selection"),
-                    row("Esc", "Close this panel, or clear the selection"),
-                ],
-            )),
-            Panel::About => Some((
-                "About spectro",
-                vec![
-                    row("Version", VERSION),
-                    row("What", "Acoustic spectrum analyser, after Spek"),
-                    row("Licence", "GNU GPL, version 3 or later"),
-                    row("Engine", "no_std Rust, no unsafe code"),
-                    row("Audio", "Decoded by FFmpeg"),
-                    row("Type", "Source Sans 3, SIL Open Font License"),
-                ],
-            )),
-            Panel::Settings => {
-                let s = &self.settings;
+            Panel::Help => {
+                let mut files = vec![
+                    row(&format!("{cmd}  O"), "Open a file, or drop one on the window"),
+                    row(&format!("{cmd}  S"), "Save the picture as a PNG image"),
+                ];
+                if cfg!(target_os = "macos") {
+                    files.push(row(&format!("{cmd}  Shift  R"), "Show the file in Finder"));
+                    files.push(row("", "Open Recent is in the File menu"));
+                }
+                files.push(row(&format!("{cmd}  W"), "Close the window"));
+                let settings_key = if cfg!(target_os = "macos") { format!("{cmd}  ,") } else { format!("{cmd}  E") };
                 Some((
-                    "Settings",
+                    "spectro Help",
                     vec![
-                        row("p  P", &format!("Palette: {}", s.palette.name())),
-                        row("f  F", &format!("Window function: {}", s.window.name())),
-                        row("w  W", &format!("Window size: {}", 1u32 << s.fft_bits)),
-                        row("u  U", &format!("Upper limit: {} dBFS", s.upper_db)),
-                        row("l  L", &format!("Lower limit: {} dBFS", s.lower_db)),
-                        row("y  Y", &format!("Frequency scale: {}", s.freq_scale.name())),
-                        row("g", &format!("Glow: {}", if s.glow { "on" } else { "off" })),
-                        row("", "Saved automatically"),
+                        section("Files", files),
+                        section(
+                            "Listening",
+                            vec![
+                                row("Drag", "Select a region: it loops, filtered to its band"),
+                                row("Space", "Stop or restart the loop"),
+                                row("Click  Esc", "Clear the selection"),
+                            ],
+                        ),
+                        section(
+                            "Reading the picture",
+                            vec![
+                                row("", "Time runs left to right, frequency bottom to top"),
+                                row("", "Colour is level in dBFS; the bar on the right is the key"),
+                                row("", "The strip on top is loudness: peak and RMS"),
+                                row("", "Hover to read time, frequency and level"),
+                            ],
+                        ),
+                        section(
+                            "Picture",
+                            vec![
+                                row("p  P", "Next or previous palette"),
+                                row("y  Y", "Frequency scale: linear, mel, log"),
+                                row("g", "Glow on loud parts"),
+                                row("u  U", "Raise or lower the top of the range"),
+                                row("l  L", "Raise or lower the bottom of the range"),
+                            ],
+                        ),
+                        section(
+                            "Analysis",
+                            vec![
+                                row("w  W", "Larger or smaller DFT window"),
+                                row("f  F", "Next or previous window function"),
+                                row("c  C", "Next or previous channel"),
+                                row("s  S", "Next or previous stream"),
+                            ],
+                        ),
+                        section(
+                            "Help",
+                            vec![
+                                row("F1", "Show or hide this help"),
+                                row("Shift  F1", "About spectro"),
+                                row(&settings_key, "Current settings"),
+                            ],
+                        ),
                     ],
                 ))
             }
+            Panel::About => Some((
+                "About spectro",
+                vec![section(
+                    "",
+                    vec![
+                        row("", &format!("Version {VERSION}")),
+                        row("", "An acoustic spectrum analyser, after Spek"),
+                        row("", "GNU General Public License, version 3 or later"),
+                        row("", "no_std Rust engine with no unsafe code"),
+                        row("", "Audio decoded and played by FFmpeg"),
+                        row("", "Type: Source Sans 3, SIL Open Font License"),
+                    ],
+                )],
+            )),
+            Panel::Settings => Some((
+                "Settings",
+                vec![
+                    section(
+                        "Picture",
+                        vec![
+                            row("p  P", &format!("Palette: {}", s.palette.name())),
+                            row("y  Y", &format!("Frequency scale: {}", s.freq_scale.name())),
+                            row("g", &format!("Glow: {}", if s.glow { "on" } else { "off" })),
+                            row("u  U", &format!("Upper limit: {} dBFS", s.upper_db)),
+                            row("l  L", &format!("Lower limit: {} dBFS", s.lower_db)),
+                        ],
+                    ),
+                    section(
+                        "Analysis",
+                        vec![
+                            row("f  F", &format!("Window function: {}", s.window.name())),
+                            row("w  W", &format!("Window size: {} points", 1u32 << s.fft_bits)),
+                        ],
+                    ),
+                ],
+            )),
         }
     }
 
@@ -333,13 +403,13 @@ impl App {
         let title = self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
         let desc = if self.path.is_some() { self.description() } else { String::new() };
         let message = self.message();
-        let panel = self.panel_rows();
+        let panel = self.panel_content();
         let job = self.job.as_ref().map(|j| j.shared.clone());
         let guard = job.as_ref().and_then(|j| j.lock().ok());
         let spec = guard.as_ref().map(|g| &g.spectrogram);
         let mut v = crate::view(&title, &desc, self.current(), spec, &self.settings, scale);
         v.message = message.as_deref();
-        v.panel = panel.as_ref().map(|(t, r)| (*t, r.as_slice()));
+        v.panel = panel.as_ref().map(|(title, sections)| RenderPanel { title, sections, footer: "Esc to close" });
         v.cursor = if self.panel == Panel::None && self.drag.is_none() { self.cursor } else { None };
         let region = self.dragged_region().or(self.selection);
         v.selection = region.map(|r| Selection {
@@ -403,13 +473,101 @@ impl App {
         };
     }
 
+    /// Maps a key press to an action; menus produce the same actions.
     fn key(&mut self, event_loop: &ActiveEventLoop, key: Key) {
         let command = if cfg!(target_os = "macos") { self.mods.super_key() } else { self.mods.control_key() };
-        match key {
-            Key::Named(NamedKey::F1) => {
-                self.panel = if self.mods.shift_key() { Panel::About } else { Panel::Help };
+        let action = match key {
+            Key::Named(NamedKey::F1) if self.mods.shift_key() => Action::About,
+            Key::Named(NamedKey::F1) => Action::Help,
+            Key::Named(NamedKey::Escape) => Action::ClearSelection,
+            Key::Named(NamedKey::Space) => Action::TogglePlay,
+            Key::Character(s) if command => match s.to_lowercase().as_str() {
+                "o" => Action::Open,
+                "s" => Action::Save,
+                "r" if self.mods.shift_key() => Action::Reveal,
+                "e" | "," => Action::Settings,
+                "?" | "/" => Action::Help,
+                "q" | "w" => Action::Close,
+                _ => return,
+            },
+            Key::Character(s) => {
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Action::Key(c),
+                    _ => return,
+                }
             }
-            Key::Named(NamedKey::Escape) => {
+            _ => return,
+        };
+        self.act(event_loop, action);
+    }
+
+    fn toggle_panel(&mut self, panel: Panel) {
+        self.panel = if self.panel == panel { Panel::None } else { panel };
+    }
+
+    /// Applies a settings change and redoes the analysis if it needs to.
+    fn change_settings(&mut self, change: impl FnOnce(&mut Settings) -> bool) {
+        let before = self.settings;
+        if !change(&mut self.settings) || before == self.settings {
+            return;
+        }
+        self.settings.save();
+        if before.fft_bits != self.settings.fft_bits || before.window != self.settings.window {
+            self.restart();
+        }
+    }
+
+    fn act(&mut self, event_loop: &ActiveEventLoop, action: Action) {
+        match action {
+            Action::Open => {
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    if let Some(p) = dialogs::open() {
+                        let _ = proxy.send_event(UserEvent::Open(p));
+                    }
+                });
+            }
+            Action::OpenRecent(i) => {
+                if let Some(p) = self.recent.get(i).cloned() {
+                    self.load(p, 0, 0);
+                }
+            }
+            Action::ClearRecent => {
+                self.recent.clear();
+                recent::save(&self.recent);
+            }
+            Action::Save => {
+                let Some(path) = &self.path else { return };
+                let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+                let name = format!("{}.png", stem.unwrap_or_else(|| "spectrogram".into()));
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    if let Some(p) = dialogs::save(&name) {
+                        let _ = proxy.send_event(UserEvent::Save(p));
+                    }
+                });
+            }
+            Action::Reveal => {
+                if let Some(path) = &self.path {
+                    dialogs::reveal(path);
+                }
+            }
+            Action::Close => event_loop.exit(),
+            Action::About => self.toggle_panel(Panel::About),
+            Action::Settings => self.toggle_panel(Panel::Settings),
+            Action::Help => self.toggle_panel(Panel::Help),
+            Action::TogglePlay => {
+                if self.selection.is_none() {
+                    return;
+                }
+                if self.player.is_some() {
+                    self.player = None;
+                } else {
+                    self.play();
+                }
+            }
+            Action::ClearSelection => {
                 if self.panel != Panel::None {
                     self.panel = Panel::None;
                 } else {
@@ -417,40 +575,8 @@ impl App {
                     self.status = None;
                 }
             }
-            Key::Named(NamedKey::Space) if self.selection.is_some() => {
-                if self.player.is_some() {
-                    self.player = None;
-                } else {
-                    self.play();
-                }
-            }
-            Key::Character(s) if command => match s.to_lowercase().as_str() {
-                "o" => {
-                    let proxy = self.proxy.clone();
-                    std::thread::spawn(move || {
-                        if let Some(p) = dialogs::open() {
-                            let _ = proxy.send_event(UserEvent::Open(p));
-                        }
-                    });
-                }
-                "s" if self.path.is_some() => {
-                    let stem = self.path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().into_owned());
-                    let name = format!("{}.png", stem.unwrap_or_else(|| "spectrogram".into()));
-                    let proxy = self.proxy.clone();
-                    std::thread::spawn(move || {
-                        if let Some(p) = dialogs::save(&name) {
-                            let _ = proxy.send_event(UserEvent::Save(p));
-                        }
-                    });
-                }
-                "e" => {
-                    self.panel = if self.panel == Panel::Settings { Panel::None } else { Panel::Settings };
-                }
-                "q" | "w" => event_loop.exit(),
-                _ => return,
-            },
-            Key::Character(s) => {
-                let Some(c) = s.chars().next().filter(|_| s.chars().count() == 1) else { return };
+            Action::Set(key, value) => self.change_settings(|s| s.set(&key, &value)),
+            Action::Key(c) => {
                 let streams = self.streams.as_ref().map_or(0, |s| s.len());
                 let channels = self.current().map_or(0, |s| s.channels as usize);
                 let step = |v: usize, n: usize, fwd: bool| if fwd { (v + 1) % n } else { (v + n - 1) % n };
@@ -466,23 +592,23 @@ impl App {
                         self.channel = self.channel.min(ch - 1);
                         self.restart();
                     }
-                    _ => {
-                        let before = self.settings;
-                        if !self.settings.key(c) {
-                            return;
-                        }
-                        self.settings.save();
-                        let reanalyse =
-                            before.fft_bits != self.settings.fft_bits || before.window != self.settings.window;
-                        if reanalyse {
-                            self.restart();
-                        }
-                    }
+                    _ => self.change_settings(|s| s.key(c)),
                 }
             }
-            _ => return,
         }
+        self.sync_menu();
         self.redraw_later();
+    }
+
+    fn sync_menu(&mut self) {
+        if let Some(m) = &mut self.menu {
+            m.sync(&MenuState {
+                settings: &self.settings,
+                has_file: self.path.is_some(),
+                has_selection: self.selection.is_some(),
+                recent: &self.recent,
+            });
+        }
     }
 }
 
@@ -507,6 +633,8 @@ impl ApplicationHandler<UserEvent> for App {
             let surface = softbuffer::Surface::new(&context, window.clone())?;
             Ok(Gfx { window, surface, _context: context })
         });
+        self.menu = Some(MenuBar::install(self.proxy.clone()));
+        self.sync_menu();
         match gfx {
             Ok(g) => self.gfx = Some(g),
             Err(e) => {
@@ -518,9 +646,14 @@ impl ApplicationHandler<UserEvent> for App {
         self.restart();
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Progress => {}
+            UserEvent::Menu(id) => {
+                if let Some(a) = Action::parse(&id) {
+                    self.act(event_loop, a);
+                }
+            }
             UserEvent::Open(p) => self.load(p, 0, 0),
             UserEvent::Save(p) => self.save(&p),
         }

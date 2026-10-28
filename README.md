@@ -13,7 +13,8 @@ spectrograms around.
   dependencies and no `unsafe` code. It does the FFT, the analysis, the
   palettes, the text, the layout and the PNG encoding by itself, and builds
   for bare-metal targets. The program around it is also `unsafe`-free and
-  adds only `winit` and `softbuffer` for the window.
+  adds only `winit` and `softbuffer` for the window, and on macOS `muda`
+  for the menu bar.
 - **FFmpeg in its own process.** Audio is decoded by the `ffmpeg` and
   `ffprobe` programs, not linked in. A broken or hostile file can at worst
   crash the decoder, never spectro. File names go to FFmpeg as plain
@@ -87,6 +88,18 @@ spectro -o song.png --width 1600 --height 900 --scale 2 song.flac
 `spectro --help` lists every option: stream, channel, palette, window
 function, window size and dynamic range.
 
+### Menus and help
+
+On macOS spectro has a native menu bar:
+- **File**: Open, Open Recent, Save Image, Show in Finder, Close Window.
+- **View**: palette, frequency scale, window function, window size, dynamic
+  range, glow, channel and stream. The current choices are checked.
+- **Playback**: play, stop or clear the selected region.
+- **Window** and **Help**.
+
+On every platform, `F1` opens a help screen listing everything spectro can
+do, and the empty window points to it.
+
 ### Keys
 
 On macOS use Cmd instead of Ctrl.
@@ -98,8 +111,10 @@ On macOS use Cmd instead of Ctrl.
 | `Space` | Stop or restart the loop |
 | `Ctrl-O` | Open a file |
 | `Ctrl-S` | Save the picture as PNG |
-| `Ctrl-E` | Show the settings |
-| `F1` | Show the keys |
+| `Cmd-Shift-R` | Show the file in Finder (macOS) |
+| `Ctrl-W`, `Ctrl-Q` | Close the window |
+| `Ctrl-E` (`Cmd-,` on macOS) | Show the settings |
+| `F1` | Show the help screen |
 | `Shift-F1` | About |
 | `c`, `C` | Change the audio channel |
 | `s`, `S` | Change the audio stream |
@@ -112,14 +127,14 @@ On macOS use Cmd instead of Ctrl.
 | `g` | Turn the glow on or off |
 | `Esc` | Close a panel, or clear the selection |
 
-Palette, window function, window size, range, frequency scale and glow
-are saved in
+The ten most recent files are listed in File > Open Recent. Palette,
+window function, window size, range, frequency scale and glow are saved in
 `~/.config/spectro/preferences` (or `$XDG_CONFIG_HOME`, or `%APPDATA%` on
 Windows).
 
 ## Differences from Spek
 
-- `F1` shows the keys in the window instead of opening the online manual.
+- `F1` shows a help screen in the window instead of opening the online manual.
 - `Ctrl-E` shows the current settings. Spek's preferences dialog sets the
   language and update checks; spectro is English only and never uses the
   network.
@@ -134,7 +149,7 @@ Windows).
 | Path | What |
 | --- | --- |
 | `crates/spectro-core` | The `no_std` engine: `math`, `fft`, `analysis`, `palette`, `font`, `canvas`, `render`, `png` |
-| `src` | The program: FFmpeg input, background analysis, region playback (`ffplay`), window, dialogs, settings, command line |
+| `src` | The program: FFmpeg input, background analysis, region playback (`ffplay`), window, menus (`muda`, macOS only), dialogs, settings, recent files, command line |
 | `tools/fontgen.py` | Extracts glyph outlines from a TrueType font into `crates/spectro-core/assets` |
 
 ## Licence
