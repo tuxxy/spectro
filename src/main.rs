@@ -42,20 +42,22 @@ Options:
       --freq LOW-HIGH         zoom --output to a frequency range in Hz, e.g. 200-4000
   -s, --stream N              audio stream, starting at 1
   -c, --channel N             audio channel, starting at 1
-  -p, --palette NAME          ember, spectrum, sox, mono, glacier or aurora
+  -p, --palette NAME          ember, spectrum, sox, mono, glacier, aurora or sonar
   -f, --window-function NAME  hann, hamming or blackman-harris
   -w, --window-size N         DFT size, a power of two from 256 to 16384
   -u, --upper DB              upper limit of the dynamic range in dBFS
   -l, --lower DB              lower limit of the dynamic range in dBFS
       --glow on|off           let loud components bloom (default on)
       --freq-scale NAME       linear (default), mel or log
+      --sonar                 submarine mode: a green sonar waterfall, time
+                              running down, frequency across
   -h, --help                  show this help and exit
   -V, --version               show the version and exit
 
 Keys: Ctrl-O open, Ctrl-S save, Ctrl-E settings, F1 help (Cmd on macOS).
   c/C channel  s/S stream  p/P palette  f/F window function
   w/W window size  u/U upper limit  l/L lower limit
-  y/Y frequency scale  g glow
+  y/Y frequency scale  g glow  m submarine mode
 Mouse: drag a box to loop that region, filtered to its band; Space stops
 or restarts it; a click or Esc clears it. Zoom with a pinch, Cmd/Ctrl-scroll,
 + and -, or Z for the selected box; scroll to move; 0 shows everything.
@@ -165,6 +167,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-l" | "--lower" => args.settings.push(("lower_db", value()?)),
             "--glow" => args.settings.push(("glow", value()?)),
             "--freq-scale" => args.settings.push(("freq_scale", value()?)),
+            "--sonar" => args.settings.push(("sonar", "on".into())),
             _ => return Err(format!("unknown option {name}")),
         }
     }
@@ -201,6 +204,7 @@ pub fn view<'a>(
         freq_scale: settings.freq_scale,
         cursor: None,
         selection: None,
+        sonar: settings.sonar,
     }
 }
 
@@ -235,7 +239,7 @@ fn render_to_file(args: &Args, settings: &Settings, output: &Path) -> Result<(),
         t1,
         fft_bits: settings.fft_bits,
         window: settings.window,
-        columns: plot.w as usize,
+        columns: if settings.sonar { plot.h } else { plot.w } as usize,
     };
     let mut spec = Spectrogram::new(req.columns, bands(req.fft_bits));
     pipeline::run(&req, &AtomicBool::new(false), &mut |c| spec.set(c))?;

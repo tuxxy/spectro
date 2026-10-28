@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use spectro_core::analysis::Envelope;
 use spectro_core::canvas::Canvas;
-use spectro_core::render::{Axes, Panel as RenderPanel, Renderer, Section, Selection, plot_rect, strip_rect};
+use spectro_core::render::{Axes, Panel as RenderPanel, Renderer, Section, Selection, plot_rect, scrolled, strip_rect};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -165,10 +165,24 @@ impl App {
             size.width as usize,
             size.height as usize,
             scale,
-            self.time_range(),
+            self.shown_time(),
             self.freq_range(),
             self.settings.freq_scale,
+            self.settings.sonar,
         ))
+    }
+
+    /// The seconds in the plot: the view, or in submarine mode while the
+    /// analysis runs, the view scrolled to its front.
+    fn shown_time(&self) -> (f64, f64) {
+        let progress = self.job.as_ref().and_then(|j| {
+            let sh = j.shared.lock().ok()?;
+            Some(((j.request.t0, j.request.t1), sh.spectrogram.filled(), sh.spectrogram.columns()))
+        });
+        match progress {
+            Some((data, filled, columns)) => scrolled(self.settings.sonar, self.time_range(), data, filled, columns),
+            None => self.time_range(),
+        }
     }
 
     fn duration(&self) -> f64 {
@@ -236,18 +250,22 @@ impl App {
     }
 
     /// Scroll: pan in time (Alt: in frequency); Cmd or Ctrl: zoom in time.
+    /// The picture follows the fingers, whichever way its axes run.
     fn scroll(&mut self, dx: f64, dy: f64) {
         let Some(axes) = self.axes() else { return };
         let zoom = if cfg!(target_os = "macos") { self.mods.super_key() } else { self.mods.control_key() };
+        let sonar = self.settings.sonar;
         if zoom {
             self.zoom_time_by((-dy / 300.0).exp(), self.anchor_time());
         } else if self.mods.alt_key() {
             let (f0, f1) = self.freq_range();
-            let df = dy * (f1 - f0) / axes.plot.h.max(1) as f64;
+            let moved = if sonar { -(dx + dy) } else { dy };
+            let df = moved * (f1 - f0) / axes.freq_len().max(1) as f64;
             self.set_freq_range(f0 + df, f1 + df);
         } else {
             let (t0, t1) = self.time_range();
-            let dt = -(dx + dy) * (t1 - t0) / axes.plot.w.max(1) as f64;
+            let moved = if sonar { dy } else { -(dx + dy) };
+            let dt = moved * (t1 - t0) / axes.time_len().max(1) as f64;
             self.set_time_range(t0 + dt, t1 + dt);
         }
     }
@@ -286,7 +304,8 @@ impl App {
             ElementState::Pressed => {
                 let Some(cur) = self.cursor else { return };
                 // A click in the loudness strip centres the view there.
-                if let (Some(e), true, Some(_)) = (self.strip(), self.zoom_time.is_some(), &self.overview) {
+                let loudness = !self.settings.sonar && self.zoom_time.is_some();
+                if let (Some(e), true, Some(_)) = (self.strip(), loudness, &self.overview) {
                     let inside = cur.0 >= e.x as f32 && cur.0 < (e.x + e.w) as f32;
                     if inside && cur.1 >= e.y as f32 && cur.1 < (e.y + e.h) as f32 {
                         let t = (cur.0 - e.x as f32) as f64 / e.w as f64 * self.duration();
@@ -329,7 +348,9 @@ impl App {
         match &self.gfx {
             Some(g) => {
                 let size = g.window.inner_size();
-                plot_rect(size.width as usize, size.height as usize, g.window.scale_factor() as f32).w as usize
+                let plot = plot_rect(size.width as usize, size.height as usize, g.window.scale_factor() as f32);
+                // One column per pixel along the time axis.
+                (if self.settings.sonar { plot.h } else { plot.w }) as usize
             }
             None => 0,
         }
@@ -446,12 +467,21 @@ impl App {
                         ),
                         section(
                             "Reading the picture",
-                            vec![
-                                row("", "Time runs left to right, frequency bottom to top"),
-                                row("", "Colour is level in dBFS; the bar on the right is the key"),
-                                row("", "The strip on top is loudness: peak and RMS"),
-                                row("", "Hover to read time, frequency and level"),
-                            ],
+                            if s.sonar {
+                                vec![
+                                    row("", "Frequency runs left to right, time runs down"),
+                                    row("", "The newest moment is at the top, as on a sonar"),
+                                    row("", "The strip on top traces the spectrum shown"),
+                                    row("", "Hover to trace one moment and read its level"),
+                                ]
+                            } else {
+                                vec![
+                                    row("", "Time runs left to right, frequency bottom to top"),
+                                    row("", "Colour is level in dBFS; the bar on the right is the key"),
+                                    row("", "The strip on top is loudness: peak and RMS"),
+                                    row("", "Hover to read time, frequency and level"),
+                                ]
+                            },
                         ),
                         section(
                             "Picture",
@@ -459,6 +489,7 @@ impl App {
                                 row("p  P", "Next or previous palette"),
                                 row("y  Y", "Frequency scale: linear, mel, log"),
                                 row("g", "Glow on loud parts"),
+                                row("m", "Submarine mode: a green sonar waterfall"),
                                 row("u  U", "Raise or lower the top of the range"),
                                 row("l  L", "Raise or lower the bottom of the range"),
                             ],
@@ -506,6 +537,7 @@ impl App {
                             row("p  P", &format!("Palette: {}", s.palette.name())),
                             row("y  Y", &format!("Frequency scale: {}", s.freq_scale.name())),
                             row("g", &format!("Glow: {}", if s.glow { "on" } else { "off" })),
+                            row("m", &format!("Submarine mode: {}", if s.sonar { "on" } else { "off" })),
                             row("u  U", &format!("Upper limit: {} dBFS", s.upper_db)),
                             row("l  L", &format!("Lower limit: {} dBFS", s.lower_db)),
                         ],
@@ -612,6 +644,9 @@ impl App {
             Key::Named(NamedKey::Space) => Action::TogglePlay,
             Key::Named(NamedKey::ArrowLeft) => Action::Pan(-2),
             Key::Named(NamedKey::ArrowRight) => Action::Pan(2),
+            // In submarine mode time runs up the screen.
+            Key::Named(NamedKey::ArrowUp) if self.settings.sonar => Action::Pan(2),
+            Key::Named(NamedKey::ArrowDown) if self.settings.sonar => Action::Pan(-2),
             Key::Character(s) if command => match s.to_lowercase().as_str() {
                 "o" => Action::Open,
                 "s" => Action::Save,
@@ -651,7 +686,9 @@ impl App {
             return;
         }
         self.settings.save();
-        if before.fft_bits != self.settings.fft_bits || before.window != self.settings.window {
+        let analysis = before.fft_bits != self.settings.fft_bits || before.window != self.settings.window;
+        // Submarine mode turns the time axis, which changes the column count.
+        if analysis || before.sonar != self.settings.sonar {
             self.restart();
         }
     }

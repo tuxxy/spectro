@@ -21,14 +21,45 @@ pub const MAX_DB: i32 = 0;
 pub const DEFAULT_UPPER_DB: i32 = 0;
 pub const DEFAULT_LOWER_DB: i32 = -120;
 
-const BG_TOP: [f32; 3] = [18.0, 19.0, 27.0];
-const BG_BOTTOM: [f32; 3] = [7.0, 7.0, 10.0];
-const TEXT: u32 = 0xf1f2f6;
-const TEXT_DIM: u32 = 0x8d91a0;
-const TEXT_FAINT: u32 = 0x5f6372;
-const WELL: u32 = 0x0e0f15;
-const WHITE: u32 = 0xffffff;
-const CARD: u32 = 0x17181f;
+/// Colours of everything but the spectrogram.
+#[derive(Clone, Copy)]
+struct Theme {
+    bg_top: [f32; 3],
+    bg_bottom: [f32; 3],
+    text: u32,
+    dim: u32,
+    faint: u32,
+    well: u32,
+    /// Hairlines, grid and highlights, drawn at low opacity.
+    line: u32,
+    card: u32,
+    /// Text on an accent-coloured label.
+    ink: u32,
+}
+
+const STUDIO: Theme = Theme {
+    bg_top: [18.0, 19.0, 27.0],
+    bg_bottom: [7.0, 7.0, 10.0],
+    text: 0xf1f2f6,
+    dim: 0x8d91a0,
+    faint: 0x5f6372,
+    well: 0x0e0f15,
+    line: 0xffffff,
+    card: 0x17181f,
+    ink: 0x101014,
+};
+
+const SONAR: Theme = Theme {
+    bg_top: [5.0, 16.0, 10.0],
+    bg_bottom: [1.0, 5.0, 3.0],
+    text: 0xb4f7c2,
+    dim: 0x4fae6c,
+    faint: 0x2e6b43,
+    well: 0x010603,
+    line: 0x7dff9e,
+    card: 0x06140b,
+    ink: 0x021006,
+};
 
 /// How frequency maps to height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -120,6 +151,7 @@ impl FreqScale {
 }
 
 /// Everything the renderer needs to know about what to show.
+#[derive(Clone, Copy)]
 pub struct View<'a> {
     /// Analysed data, if any. Its column count need not match the plot width.
     pub spectrogram: Option<&'a Spectrogram>,
@@ -160,6 +192,28 @@ pub struct View<'a> {
     pub cursor: Option<(f32, f32)>,
     /// A selected time and frequency region, e.g. for looped playback.
     pub selection: Option<Selection>,
+    /// Submarine mode: a sonar waterfall in green phosphor. Frequency runs
+    /// across and time runs down, the newest at the top; while the analysis
+    /// runs, the picture scrolls down as it arrives. The strip above shows
+    /// the spectrum, as a sonar's line trace.
+    pub sonar: bool,
+}
+
+impl View<'_> {
+    /// The seconds shown in the plot. In submarine mode, while the
+    /// analysis runs, the view rides on its front so the picture scrolls.
+    pub fn shown_time(&self, filled: usize, columns: usize) -> (f64, f64) {
+        scrolled(self.sonar, self.time_range, self.data_range, filled, columns)
+    }
+}
+
+/// See [`View::shown_time`].
+pub fn scrolled(sonar: bool, time: (f64, f64), data: (f64, f64), filled: usize, columns: usize) -> (f64, f64) {
+    if !sonar || time != data || columns == 0 || filled >= columns {
+        return time;
+    }
+    let lag = (time.1 - time.0) * (columns - filled) as f64 / columns as f64;
+    (time.0 - lag, time.1 - lag)
 }
 
 /// A card over the picture: help, settings or about.
@@ -281,6 +335,8 @@ pub struct Axes {
     time: (f64, f64),
     freq: (f64, f64),
     scale: FreqScale,
+    /// Frequency across and time up, as in submarine mode.
+    waterfall: bool,
 }
 
 impl Axes {
@@ -291,19 +347,27 @@ impl Axes {
         time: (f64, f64),
         freq: (f64, f64),
         scale: FreqScale,
+        waterfall: bool,
     ) -> Self {
-        Axes { plot: plot_rect(width, height, ui_scale), time, freq, scale }
+        Axes { plot: plot_rect(width, height, ui_scale), time, freq, scale, waterfall }
     }
 
     fn of(plot: Plot, v: &View) -> Self {
-        Axes { plot, time: v.time_range, freq: v.freq_range, scale: v.freq_scale }
+        Axes { plot, time: v.time_range, freq: v.freq_range, scale: v.freq_scale, waterfall: v.sonar }
+    }
+
+    /// Fractions of the way across (left to right) and up (bottom to top).
+    fn fractions(&self, x: f32, y: f32) -> (f64, f64) {
+        let p = self.plot;
+        let a = ((x - p.x as f32) / p.w.max(1) as f32).clamp(0.0, 1.0) as f64;
+        let b = (((p.y + p.h) as f32 - y) / p.h.max(1) as f32).clamp(0.0, 1.0) as f64;
+        (a, b)
     }
 
     /// Seconds and hertz under `(x, y)`, clamped to the plot.
     pub fn to_data(&self, x: f32, y: f32) -> (f64, f64) {
-        let p = self.plot;
-        let u = ((x - p.x as f32) / p.w.max(1) as f32).clamp(0.0, 1.0) as f64;
-        let v = (((p.y + p.h) as f32 - y) / p.h.max(1) as f32).clamp(0.0, 1.0) as f64;
+        let (a, b) = self.fractions(x, y);
+        let (u, v) = if self.waterfall { (b, a) } else { (a, b) };
         let (t0, t1) = self.time;
         (t0 + u * (t1 - t0), self.scale.freq(v, self.freq.0, self.freq.1).max(0.0))
     }
@@ -314,7 +378,18 @@ impl Axes {
         let (t0, t1) = self.time;
         let u = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
         let v = self.scale.frac(f.max(1e-9), self.freq.0, self.freq.1).clamp(-1.0, 2.0);
-        (p.x as f32 + (u * p.w as f64) as f32, (p.y + p.h) as f32 - (v * p.h as f64) as f32)
+        let (a, b) = if self.waterfall { (v, u) } else { (u, v) };
+        (p.x as f32 + (a * p.w as f64) as f32, (p.y + p.h) as f32 - (b * p.h as f64) as f32)
+    }
+
+    /// Plot pixels along the time axis.
+    pub fn time_len(&self) -> i64 {
+        if self.waterfall { self.plot.h } else { self.plot.w }
+    }
+
+    /// Plot pixels along the frequency axis.
+    pub fn freq_len(&self) -> i64 {
+        if self.waterfall { self.plot.w } else { self.plot.h }
     }
 
     pub fn contains(&self, x: f32, y: f32) -> bool {
@@ -333,10 +408,10 @@ fn format_freq(f: f64) -> String {
     if f < 1000.0 { format!("{f:.0} Hz") } else { format!("{:.2} kHz", f / 1000.0) }
 }
 
-fn background(y: usize, height: usize) -> [f32; 3] {
+fn background(theme: &Theme, y: usize, height: usize) -> [f32; 3] {
     let t = y as f32 / height.max(1) as f32;
     let t = t * t * (3.0 - 2.0 * t);
-    [0, 1, 2].map(|i| BG_TOP[i] + (BG_BOTTOM[i] - BG_TOP[i]) * t)
+    [0, 1, 2].map(|i| theme.bg_top[i] + (theme.bg_bottom[i] - theme.bg_top[i]) * t)
 }
 
 /// Picks evenly spaced, round axis values between `min` and `max` that are
@@ -400,12 +475,74 @@ fn blur(buf: &mut [[f32; 3]], tmp: &mut Vec<[f32; 3]>, w: usize, h: usize, r: us
     }
 }
 
+/// For each of `n` pixels along the frequency axis, lowest first: the
+/// fractional band at its centre and the whole bands it spans.
+fn band_rows(n: usize, bands: usize, v: &View) -> Vec<(f32, usize, usize)> {
+    let (scale, nyquist, lo, hi) = match v.sample_rate {
+        0 => (FreqScale::Linear, 1.0, 0.0, 1.0),
+        r => (v.freq_scale, r as f64 / 2.0, v.freq_range.0, v.freq_range.1),
+    };
+    let band_at = |u: f64| (scale.freq(u, lo, hi) / nyquist * (bands - 1) as f64).clamp(0.0, (bands - 1) as f64) as f32;
+    (0..n)
+        .map(|k| {
+            let bottom = band_at(k as f64 / n as f64);
+            let top = band_at((k + 1) as f64 / n as f64);
+            (0.5 * (top + bottom), math::ceilf(bottom) as usize, (math::floorf(top) as usize).min(bands - 1))
+        })
+        .collect()
+}
+
+/// Level of one pixel's frequency span. A span over several bands takes the
+/// loudest, so thin tones survive; within one band it interpolates smoothly.
+fn band_db(col: &[f32], (mid, lo, hi): (f32, usize, usize)) -> f32 {
+    if hi > lo {
+        return col[lo..=hi].iter().copied().fold(f32::MIN, f32::max);
+    }
+    // Catmull-Rom, clamped to its neighbours to avoid ringing.
+    let bands = col.len();
+    let i = (mid as usize).min(bands - 2);
+    let t = mid - i as f32;
+    let g = |k: isize| col[(i as isize + k).clamp(0, bands as isize - 1) as usize];
+    let (a, b, cc, d) = (g(-1), g(0), g(1), g(2));
+    let y = 0.5
+        * (2.0 * b
+            + (cc - a) * t
+            + (2.0 * a - 5.0 * b + 4.0 * cc - d) * t * t
+            + (3.0 * b - a - 3.0 * cc + d) * t * t * t);
+    y.clamp(b.min(cc), b.max(cc))
+}
+
+/// Draws `values` (0 to 1, one per pixel) as a line across the strip `e`,
+/// optionally filled underneath.
+fn trace_line(c: &mut Canvas, e: Plot, pad: f32, values: &[f32], color: u32, fill: f32, thick: i64) {
+    let bottom = (e.y + e.h) as f32 - pad;
+    let h = e.h as f32 - 2.0 * pad;
+    let y_of = |v: f32| (bottom - v.clamp(0.0, 1.0) * h) as i64;
+    let mut prev = None;
+    for (x, &v) in values.iter().enumerate().take(e.w as usize) {
+        let y = y_of(v);
+        let x = e.x + x as i64;
+        if fill > 0.0 {
+            c.fill(x, y, 1, bottom as i64 - y, color, fill);
+        }
+        let (a, b) = match prev {
+            Some(p) => (y.min(p), y.max(p)),
+            None => (y, y),
+        };
+        c.fill(x, a, 1, b - a + thick, color, 0.95);
+        prev = Some(y);
+    }
+}
+
 pub struct Renderer {
     text: Text,
     lut: Lut,
+    theme: Theme,
     levels: Vec<f32>,
     glow: Vec<[f32; 3]>,
     scratch: Vec<[f32; 3]>,
+    /// Mean level per frequency pixel of the last picture, for the trace.
+    trace: Vec<f32>,
 }
 
 impl Default for Renderer {
@@ -419,10 +556,24 @@ impl Renderer {
         Renderer {
             text: Text::new(),
             lut: Lut::new(Palette::default()),
+            theme: STUDIO,
             levels: Vec::new(),
             glow: Vec::new(),
             scratch: Vec::new(),
+            trace: Vec::new(),
         }
+    }
+
+    /// Picks the colours for `v` and returns the view as shown: in
+    /// submarine mode, scrolled to the analysis front.
+    fn prepare<'a>(&mut self, v: &View<'a>) -> View<'a> {
+        let palette = if v.sonar { Palette::Sonar } else { v.palette };
+        if self.lut.palette() != palette {
+            self.lut = Lut::new(palette);
+        }
+        self.theme = if v.sonar { SONAR } else { STUDIO };
+        let (filled, columns) = v.spectrogram.map_or((0, 0), |s| (s.filled(), s.columns()));
+        View { time_range: v.shown_time(filled, columns), ..*v }
     }
 
     /// Draws the whole picture, including the crosshair.
@@ -434,6 +585,7 @@ impl Renderer {
     /// Draws the pointer crosshair and readout over a finished picture, so
     /// a front end can cache the picture and redraw only this on movement.
     pub fn overlay(&mut self, c: &mut Canvas, v: &View) {
+        let v = &self.prepare(v);
         let l = layout(c.width(), c.height(), v.scale);
         let spec = v.spectrogram.filter(|s| s.columns() > 0 && s.bands() > 1);
         if l.plot.w <= 0 || l.plot.h <= 0 {
@@ -449,32 +601,36 @@ impl Renderer {
 
     /// Draws everything except the crosshair.
     pub fn render_base(&mut self, c: &mut Canvas, v: &View) {
-        if self.lut.palette() != v.palette {
-            self.lut = Lut::new(v.palette);
-        }
+        let v = &self.prepare(v);
+        let th = self.theme;
         let l = layout(c.width(), c.height(), v.scale);
         let (cw, ch) = (c.width(), c.height());
         for y in 0..ch {
-            let bg = background(y, ch);
+            let bg = background(&th, y, ch);
             for (x, p) in c.row_mut(y).iter_mut().enumerate() {
                 *p = quantize(bg, x, y);
             }
         }
-        let bg_at = move |x: usize, y: usize| quantize(background(y, ch), x, y);
+        let bg_at = move |x: usize, y: usize| quantize(background(&th, y, ch), x, y);
 
         self.header(c, &l, v, cw as f32);
         let p = l.plot;
         let spec = v.spectrogram.filter(|s| s.columns() > 0 && s.bands() > 1);
         if p.w > 0 && p.h > 0 {
-            self.envelope(c, &l, spec, v);
-            c.clip_round(l.envelope.round(l.radius * 0.7), bg_at);
+            self.trace.clear();
             match spec {
                 Some(s) if s.filled() > 0 => self.spectrogram(c, &l, s, v),
-                _ => c.fill(p.x, p.y, p.w, p.h, WELL, 1.0),
+                _ => c.fill(p.x, p.y, p.w, p.h, th.well, 1.0),
             }
+            if v.sonar {
+                self.trace_strip(c, &l);
+            } else {
+                self.envelope(c, &l, spec, v);
+            }
+            c.clip_round(l.envelope.round(l.radius * 0.7), bg_at);
             self.grid_and_axes(c, &l, v);
             c.clip_round(p.round(l.radius), bg_at);
-            c.stroke_round(p.round(l.radius), l.hair, WHITE, 0.07);
+            c.stroke_round(p.round(l.radius), l.hair, th.line, 0.07);
             self.legend(c, &l, v);
         }
         if let Some(msg) = v.message {
@@ -487,7 +643,7 @@ impl Renderer {
 
     fn header(&mut self, c: &mut Canvas, l: &Layout, v: &View, w: f32) {
         let s = l.s;
-        let mark = "spectro";
+        let mark = if v.sonar { "spectro sonar" } else { "spectro" };
         let mw = self.text.width(Weight::Semibold, 13.0 * s, mark);
         let mark_x = w - l.margin - mw;
         let title_base = l.title_y + self.text.ascent(Weight::Semibold, l.title_px);
@@ -496,7 +652,7 @@ impl Renderer {
             Weight::Semibold,
             13.0 * s,
             (mark_x, title_base - self.text.ascent(Weight::Semibold, 13.0 * s)),
-            TEXT_FAINT,
+            self.theme.faint,
             mark,
         );
 
@@ -505,12 +661,12 @@ impl Renderer {
         if !v.title.is_empty() && room > 0.0 {
             let (folder, name) = split_path(v.title);
             let name = self.text.fit(Weight::Semibold, l.title_px, name, room, true);
-            let nw = self.text.draw(c, Weight::Semibold, l.title_px, (x0, l.title_y), TEXT, &name);
+            let nw = self.text.draw(c, Weight::Semibold, l.title_px, (x0, l.title_y), self.theme.text, &name);
             let fx = x0 + nw + 10.0 * s;
             if !folder.is_empty() && room - nw - 10.0 * s > 40.0 * s {
                 let folder = self.text.fit(Weight::Regular, l.folder_px, folder, room - nw - 10.0 * s, false);
                 let fy = title_base - self.text.ascent(Weight::Regular, l.folder_px);
-                self.text.draw(c, Weight::Regular, l.folder_px, (fx, fy), TEXT_FAINT, &folder);
+                self.text.draw(c, Weight::Regular, l.folder_px, (fx, fy), self.theme.faint, &folder);
             }
         }
 
@@ -536,8 +692,8 @@ impl Renderer {
                 break;
             }
             let rr = RoundRect { x, y: l.chips_y, w: tw + 2.0 * pad, h: l.chip_h, r: l.chip_h / 2.0 };
-            c.fill_round(rr, WHITE, if i == 0 { 0.1 } else { 0.055 });
-            let color = if i == 0 { TEXT } else { TEXT_DIM };
+            c.fill_round(rr, self.theme.line, if i == 0 { 0.1 } else { 0.055 });
+            let color = if i == 0 { self.theme.text } else { self.theme.dim };
             self.text.draw(c, weight, l.chip_px, (x + pad, l.chips_y + (l.chip_h - lh) / 2.0), color, chip);
             x += tw + 2.0 * pad + 6.0 * s;
         }
@@ -585,9 +741,9 @@ impl Renderer {
     fn envelope(&mut self, c: &mut Canvas, l: &Layout, spec: Option<&Spectrogram>, v: &View) {
         let e = l.envelope;
         let w = e.w as usize;
-        c.fill(e.x, e.y, e.w, e.h, WELL, 1.0);
+        c.fill(e.x, e.y, e.w, e.h, self.theme.well, 1.0);
         let mid = e.y as f32 + e.h as f32 / 2.0;
-        c.fill(e.x, mid as i64, e.w, l.hair as i64, WHITE, 0.05);
+        c.fill(e.x, mid as i64, e.w, l.hair as i64, self.theme.line, 0.05);
         match (v.overview.filter(|o| !o.is_empty()), spec) {
             (Some(all), _) if v.duration > 0.0 => {
                 for x in 0..w {
@@ -616,64 +772,62 @@ impl Renderer {
         }
     }
 
+    /// The sonar's line trace: the mean spectrum of what is shown, aligned
+    /// with the frequency axis below.
+    fn trace_strip(&mut self, c: &mut Canvas, l: &Layout) {
+        let e = l.envelope;
+        let th = self.theme;
+        c.fill(e.x, e.y, e.w, e.h, th.well, 1.0);
+        for k in 1..4 {
+            c.fill(e.x, e.y + e.h * k / 4, e.w, l.hair as i64, th.line, 0.05);
+        }
+        if self.trace.is_empty() {
+            return;
+        }
+        let color = quantize(self.lut.sample(0.7), 0, 0);
+        let thick = (1.2 * l.s).max(1.0) as i64;
+        trace_line(c, e, 3.0 * l.s, &self.trace, color, 0.18, thick);
+    }
+
     fn spectrogram(&mut self, c: &mut Canvas, l: &Layout, s: &Spectrogram, v: &View) {
         let p = l.plot;
         let (pw, ph) = (p.w as usize, p.h as usize);
-        let bands = s.bands();
-        let map = Self::column_map(pw, s, v);
-        // Each pixel row covers a band interval (low frequencies at the
-        // bottom). Rows spanning several bands take the loudest, so thin
-        // tones survive; rows within one band interpolate smoothly.
-        let (scale, nyquist, lo, hi) = match v.sample_rate {
-            0 => (FreqScale::Linear, 1.0, 0.0, 1.0),
-            r => (v.freq_scale, r as f64 / 2.0, v.freq_range.0, v.freq_range.1),
-        };
-        let band_at =
-            |u: f64| (scale.freq(u, lo, hi) / nyquist * (bands - 1) as f64).clamp(0.0, (bands - 1) as f64) as f32;
-        let rows: Vec<(f32, usize, usize)> = (0..ph)
-            .map(|y| {
-                let top = band_at((ph - y) as f64 / ph as f64);
-                let bottom = band_at((ph - y - 1) as f64 / ph as f64);
-                let lo = math::ceilf(bottom) as usize;
-                let hi = (math::floorf(top) as usize).min(bands - 1);
-                (0.5 * (top + bottom), lo, hi)
-            })
-            .collect();
+        let wf = v.sonar;
+        // Time runs across (or, in a waterfall, up); frequency the other way.
+        let (nt, nf) = if wf { (ph, pw) } else { (pw, ph) };
+        let map = Self::column_map(nt, s, v);
+        let rows = band_rows(nf, s.bands(), v);
+        let at = |i: usize, k: usize| if wf { (k, ph - 1 - i) } else { (i, ph - 1 - k) };
+        let has = |x: usize, y: usize| if wf { map[ph - 1 - y].is_some() } else { map[x].is_some() };
         let range = (v.upper_db - v.lower_db) as f32;
         let lower = v.lower_db as f32;
         self.levels.clear();
         self.levels.resize(pw * ph, 0.0);
-        for (x, ci) in map.iter().enumerate() {
+        self.trace.resize(nf, 0.0);
+        let mut count = 0;
+        for (i, ci) in map.iter().enumerate() {
             let Some(ci) = *ci else { continue };
             let col = s.column(ci);
-            for (y, &(mid, lo, hi)) in rows.iter().enumerate() {
-                let db = if hi > lo {
-                    col[lo..=hi].iter().copied().fold(f32::MIN, f32::max)
-                } else {
-                    // Catmull-Rom, clamped to its neighbours to avoid ringing.
-                    let i = (mid as usize).min(bands - 2);
-                    let t = mid - i as f32;
-                    let g = |k: isize| col[(i as isize + k).clamp(0, bands as isize - 1) as usize];
-                    let (a, b, cc, d) = (g(-1), g(0), g(1), g(2));
-                    let y = 0.5
-                        * (2.0 * b
-                            + (cc - a) * t
-                            + (2.0 * a - 5.0 * b + 4.0 * cc - d) * t * t
-                            + (3.0 * b - a - 3.0 * cc + d) * t * t * t);
-                    y.clamp(b.min(cc), b.max(cc))
-                };
-                self.levels[y * pw + x] = (db - lower) / range;
+            count += 1;
+            for (k, &r) in rows.iter().enumerate() {
+                let level = (band_db(col, r) - lower) / range;
+                let (x, y) = at(i, k);
+                self.levels[y * pw + x] = level;
+                self.trace[k] += level.clamp(0.0, 1.0);
             }
+        }
+        for t in &mut self.trace {
+            *t /= count.max(1) as f32;
         }
 
         // Bloom: bright parts, blurred at half resolution, screened back on.
         let (gw, gh) = (pw.div_ceil(2), ph.div_ceil(2));
-        let glow = v.glow && map.iter().any(Option::is_some);
+        let glow = v.glow && count > 0;
         if glow {
             self.glow.clear();
             self.glow.resize(gw * gh, [0.0; 3]);
             for y in 0..ph {
-                for x in (0..pw).filter(|&x| map[x].is_some()) {
+                for x in (0..pw).filter(|&x| has(x, y)) {
                     let col = self.lut.sample(self.levels[y * pw + x]);
                     let lum = (0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]) / 255.0;
                     let k = ((lum - 0.42) / 0.58).clamp(0.0, 1.0);
@@ -688,12 +842,13 @@ impl Renderer {
             blur(&mut self.glow, &mut self.scratch, gw, gh, r);
         }
         let strength = 1.1;
+        let well = self.theme.well;
         for y in 0..ph {
             let row = c.row_mut(p.y as usize + y);
             for x in 0..pw {
                 let out = &mut row[p.x as usize + x];
-                if map[x].is_none() {
-                    *out = WELL;
+                if !has(x, y) {
+                    *out = well;
                     continue;
                 }
                 let mut col = self.lut.sample(self.levels[y * pw + x]);
@@ -717,27 +872,53 @@ impl Renderer {
             }
         }
 
-        // Progress scanline at the analysis front.
+        // Phosphor screens show their scanlines.
+        if wf {
+            let period = ((1.5 * l.s) as usize).max(1);
+            for y in (0..ph).filter(|y| (y / period) % 2 == 1) {
+                c.fill(p.x, p.y + y as i64, p.w, 1, 0x000000, 0.2);
+            }
+        }
+
+        // Progress scanline at the analysis front, fading over the older side.
         if s.filled() < s.columns() {
             let (d0, d1) = v.data_range;
             let front = d0 + (d1 - d0) * s.filled() as f64 / s.columns() as f64;
             let (t0, t1) = v.time_range;
-            let fx = ((front - t0) / (t1 - t0) * pw as f64) as i64;
-            if (0..=pw as i64).contains(&fx) {
-                let accent = self.lut.sample(0.92);
-                let fade = 28.0 * l.s;
-                for y in 0..ph {
-                    for d in 0..fade as usize {
-                        let x = fx - 1 - d as i64;
+            let u = (front - t0) / (t1 - t0);
+            let accent = self.lut.sample(0.92);
+            let fade = 28.0 * l.s;
+            let t = ((1.5 * l.s) as i64).max(1);
+            let front_px = if wf { ((1.0 - u) * ph as f64) as i64 } else { (u * pw as f64) as i64 };
+            let len = if wf { ph } else { pw } as i64;
+            if (0..=len).contains(&front_px) {
+                for d in 0..fade as usize {
+                    let k = 1.0 - d as f32 / fade;
+                    let alpha = 0.4 * k * k;
+                    if wf {
+                        let y = front_px + d as i64;
+                        if y >= len {
+                            break;
+                        }
+                        for x in 0..pw {
+                            c.blend(p.x + x as i64, p.y + y, quantize(accent, x, y as usize), alpha);
+                        }
+                    } else {
+                        let x = front_px - 1 - d as i64;
                         if x < 0 {
                             break;
                         }
-                        let k = 1.0 - d as f32 / fade;
-                        c.blend(p.x + x, p.y + y as i64, quantize(accent, x as usize, y), 0.4 * k * k);
+                        for y in 0..ph {
+                            c.blend(p.x + x, p.y + y as i64, quantize(accent, x as usize, y), alpha);
+                        }
                     }
                 }
-                let t = (1.5 * l.s) as i64;
-                c.fill(p.x + fx - t, p.y, t, p.h, quantize(accent, 0, 0), 0.9);
+                let color = quantize(accent, 0, 0);
+                if wf {
+                    c.fill(p.x, p.y + front_px, p.w, t, color, 0.9);
+                } else {
+                    c.fill(p.x + front_px - t, p.y, t, p.h, color, 0.9);
+                }
             }
         }
     }
@@ -745,13 +926,22 @@ impl Renderer {
     fn grid_and_axes(&mut self, c: &mut Canvas, l: &Layout, v: &View) {
         let p = l.plot;
         let s = l.s;
+        let th = self.theme;
         let lh = self.text.line_height(Weight::Regular, l.label_px);
         let hair = l.hair as i64;
+        let wf = v.sonar;
+        let below = (p.y + p.h) as f32 + 9.0 * s;
         if v.sample_rate > 0 {
             let (lo, hi) = v.freq_range;
             let scale = v.freq_scale;
-            let gap = (lh * 2.4) as f64;
-            let y_of = |f: f64| (p.y + p.h) as f64 - scale.frac(f, lo, hi) * p.h as f64;
+            let len = if wf { p.w } else { p.h } as f64;
+            let gap = if wf {
+                (self.text.width(Weight::Regular, l.label_px, "00.00 kHz") * 1.3) as f64
+            } else {
+                (lh * 2.4) as f64
+            };
+            // Distance from the low end of the axis, in pixels.
+            let pos = |f: f64| scale.frac(f, lo, hi) * len;
             let bottom = scale.freq(0.0, lo, hi);
             let candidates: Vec<f64> = match scale {
                 FreqScale::Linear => {
@@ -759,7 +949,7 @@ impl Renderer {
                         1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
                         50000.0,
                     ];
-                    ticks(lo, hi, p.h as f64 / (hi - lo), gap, &steps).1
+                    ticks(lo, hi, len / (hi - lo), gap, &steps).1
                 }
                 _ => [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0]
                     .iter()
@@ -770,9 +960,9 @@ impl Renderer {
             // shown is always clear; round values fill in between.
             let mut values = Vec::from([bottom]);
             for f in candidates {
-                let y = y_of(f);
-                let clear_top = y - p.y as f64 >= gap;
-                let clear_last = values.last().is_none_or(|&last| y_of(last) - y >= gap);
+                let d = pos(f);
+                let clear_top = len - d >= gap;
+                let clear_last = values.last().is_none_or(|&last| d - pos(last) >= gap);
                 if f > bottom && f < hi && clear_top && clear_last {
                     values.push(f);
                 }
@@ -780,44 +970,74 @@ impl Renderer {
             values.push(hi);
             let khz = hi >= 2000.0;
             for &f in &values {
-                let y = y_of(f);
-                if f > bottom && f < hi {
-                    c.fill(p.x, math::round(y) as i64, p.w, hair, WHITE, 0.07);
-                }
+                let d = pos(f);
+                let inner = f > bottom && f < hi;
                 let mut label = if khz { format_number(f / 1000.0) } else { format_number(f) };
                 if f == hi {
                     label.push_str(if khz { " kHz" } else { " Hz" });
                 }
                 let tw = self.text.width(Weight::Regular, l.label_px, &label);
-                let ly = (y as f32 - lh / 2.0).clamp(p.y as f32 - lh * 0.3, (p.y + p.h) as f32 - lh * 0.7);
-                self.text.draw(c, Weight::Regular, l.label_px, (p.x as f32 - 10.0 * s - tw, ly), TEXT_DIM, &label);
+                if wf {
+                    let x = p.x as f64 + d;
+                    if inner {
+                        c.fill(math::round(x) as i64, p.y, hair, p.h, th.line, 0.07);
+                    }
+                    let lx = (x as f32 - tw / 2.0).clamp(p.x as f32, ((p.x + p.w) as f32 - tw).max(p.x as f32));
+                    self.text.draw(c, Weight::Regular, l.label_px, (lx, below), th.dim, &label);
+                } else {
+                    let y = (p.y + p.h) as f64 - d;
+                    if inner {
+                        c.fill(p.x, math::round(y) as i64, p.w, hair, th.line, 0.07);
+                    }
+                    let ly = (y as f32 - lh / 2.0).clamp(p.y as f32 - lh * 0.3, (p.y + p.h) as f32 - lh * 0.7);
+                    self.text.draw(c, Weight::Regular, l.label_px, (p.x as f32 - 10.0 * s - tw, ly), th.dim, &label);
+                }
             }
         }
         let (t0, t1) = v.time_range;
         if v.duration > 0.0 && t1 > t0 {
-            let px = p.w as f64 / (t1 - t0);
-            let sample = self.text.width(Weight::Regular, l.label_px, "00:00.0");
+            let len = if wf { p.h } else { p.w } as f64;
+            let px = len / (t1 - t0);
+            let gap = if wf {
+                (lh * 2.4) as f64
+            } else {
+                (self.text.width(Weight::Regular, l.label_px, "00:00.0") * 2.0) as f64
+            };
             let steps = [
                 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
                 1800.0, 3600.0, 7200.0,
             ];
-            let (step, values) = ticks(t0, t1, px, (sample * 2.0) as f64, &steps);
-            let y = (p.y + p.h) as f32 + 9.0 * s;
+            let (step, values) = ticks(t0, t1, px, gap, &steps);
             for &t in &values {
-                let x = p.x as f64 + (t - t0) * px;
-                if t > t0 && t < t1 {
-                    c.fill(math::round(x) as i64, p.y, hair, p.h, WHITE, 0.07);
+                // A scrolling waterfall can show time before the start.
+                if t < -1e-9 || t > v.duration + 1e-9 {
+                    continue;
                 }
+                let d = (t - t0) * px;
+                let inner = t > t0 && t < t1;
                 let mut label = format_time(t, step < 1.0);
                 if (0.1..1.0).contains(&step) {
                     label.pop(); // tenths: one decimal is enough
                 }
                 let tw = self.text.width(Weight::Regular, l.label_px, &label);
-                let lx = (x as f32 - tw / 2.0).max(p.x as f32);
-                if lx + tw > (p.x + p.w) as f32 + 2.0 * s {
-                    continue;
+                if wf {
+                    let y = (p.y + p.h) as f64 - d;
+                    if inner {
+                        c.fill(p.x, math::round(y) as i64, p.w, hair, th.line, 0.07);
+                    }
+                    let ly = (y as f32 - lh / 2.0).clamp(p.y as f32 - lh * 0.3, (p.y + p.h) as f32 - lh * 0.7);
+                    self.text.draw(c, Weight::Regular, l.label_px, (p.x as f32 - 10.0 * s - tw, ly), th.dim, &label);
+                } else {
+                    let x = p.x as f64 + d;
+                    if inner {
+                        c.fill(math::round(x) as i64, p.y, hair, p.h, th.line, 0.07);
+                    }
+                    let lx = (x as f32 - tw / 2.0).max(p.x as f32);
+                    if lx + tw > (p.x + p.w) as f32 + 2.0 * s {
+                        continue;
+                    }
+                    self.text.draw(c, Weight::Regular, l.label_px, (lx, below), th.dim, &label);
                 }
-                self.text.draw(c, Weight::Regular, l.label_px, (lx, y), TEXT_DIM, &label);
             }
         }
     }
@@ -833,8 +1053,9 @@ impl Renderer {
             }
         }
         let ch = c.height();
-        c.clip_round(rr, move |x, y| quantize(background(y, ch), x, y));
-        c.stroke_round(rr, l.hair, WHITE, 0.08);
+        let th = self.theme;
+        c.clip_round(rr, move |x, y| quantize(background(&th, y, ch), x, y));
+        c.stroke_round(rr, l.hair, self.theme.line, 0.08);
 
         let lh = self.text.line_height(Weight::Regular, l.label_px);
         let (upper, lower) = (v.upper_db as f64, v.lower_db as f64);
@@ -849,19 +1070,19 @@ impl Renderer {
                 label.push_str(" dB");
             }
             let ly = (y as f32 - lh / 2.0).clamp(p.y as f32 - lh * 0.3, (p.y + p.h) as f32 - lh * 0.7);
-            self.text.draw(c, Weight::Regular, l.label_px, (lx + l.legend_w + 8.0 * l.s, ly), TEXT_DIM, &label);
+            self.text.draw(c, Weight::Regular, l.label_px, (lx + l.legend_w + 8.0 * l.s, ly), self.theme.dim, &label);
         }
     }
 
     fn selection(&mut self, c: &mut Canvas, l: &Layout, v: &View, sel: Selection) {
         let p = l.plot;
         let axes = Axes::of(p, v);
-        let (xa, ya) = axes.to_px(sel.t0.min(sel.t1), sel.f0.max(sel.f1));
-        let (xb, yb) = axes.to_px(sel.t0.max(sel.t1), sel.f0.min(sel.f1));
+        let (xa, ya) = axes.to_px(sel.t0, sel.f0);
+        let (xb, yb) = axes.to_px(sel.t1, sel.f1);
         let cx = |x: f32| (x as i64).clamp(p.x, p.x + p.w);
         let cy = |y: f32| (y as i64).clamp(p.y, p.y + p.h);
-        let (x0, y0) = (cx(xa), cy(ya));
-        let (x1, y1) = (cx(xb).max(x0 + 1), cy(yb).max(y0 + 1));
+        let (x0, y0) = (cx(xa.min(xb)), cy(ya.min(yb)));
+        let (x1, y1) = (cx(xa.max(xb)).max(x0 + 1), cy(ya.max(yb)).max(y0 + 1));
         // Spotlight: dim everything around the box.
         let dim = 0.55;
         c.fill(p.x, p.y, p.w, y0 - p.y, 0x000000, dim);
@@ -874,15 +1095,21 @@ impl Renderer {
 
         if let Some(pos) = sel.playhead {
             let t = sel.t0.min(sel.t1) + pos;
-            let (px, _) = axes.to_px(t, 0.0);
+            let (px, py) = axes.to_px(t, sel.f0);
             let w = (1.5 * l.s).max(1.0) as i64;
-            if (p.x..p.x + p.w).contains(&(px as i64)) {
-                c.fill(px as i64, y0, w, y1 - y0, accent, 0.9);
+            if v.sonar {
+                if (p.y..p.y + p.h).contains(&(py as i64)) {
+                    c.fill(x0, py as i64, x1 - x0, w, accent, 0.9);
+                }
+            } else {
+                if (p.x..p.x + p.w).contains(&(px as i64)) {
+                    c.fill(px as i64, y0, w, y1 - y0, accent, 0.9);
+                }
+                // The strip shows the whole file when it has an overview.
+                let e = l.envelope;
+                let sx = if v.overview.is_some() { e.x as f32 + (t / v.duration * e.w as f64) as f32 } else { px };
+                c.fill(sx as i64, e.y, w, e.h, accent, 0.8);
             }
-            // The strip shows the whole file when it has an overview.
-            let e = l.envelope;
-            let sx = if v.overview.is_some() { e.x as f32 + (t / v.duration * e.w as f64) as f32 } else { px };
-            c.fill(sx as i64, e.y, w, e.h, accent, 0.8);
         }
 
         let (t0, t1) = (sel.t0.min(sel.t1), sel.t0.max(sel.t1));
@@ -907,7 +1134,7 @@ impl Renderer {
         let by = if above >= p.y as f32 { above } else { y0 as f32 + 6.0 * l.s };
         let rr = RoundRect { x: bx, y: by, w, h, r: h / 2.0 };
         c.fill_round(rr, accent, 0.95);
-        self.text.draw(c, Weight::Semibold, px, (bx + pad, by + (h - lh) / 2.0), 0x101014, &text);
+        self.text.draw(c, Weight::Semibold, px, (bx + pad, by + (h - lh) / 2.0), self.theme.ink, &text);
     }
 
     fn crosshair(&mut self, c: &mut Canvas, l: &Layout, s: &Spectrogram, v: &View, (cx, cy): (f32, f32)) {
@@ -915,17 +1142,41 @@ impl Renderer {
         if !p.contains(cx, cy) {
             return;
         }
+        let th = self.theme;
         let x = cx as i64;
         let y = cy as i64;
         let hair = l.hair as i64;
-        c.fill(x, p.y, hair, p.h, WHITE, 0.3);
-        c.fill(p.x, y, p.w, hair, WHITE, 0.3);
+        c.fill(x, p.y, hair, p.h, th.line, 0.3);
+        c.fill(p.x, y, p.w, hair, th.line, 0.3);
 
         let (t, f) = Axes::of(p, v).to_data(cx, cy);
-        // The strip shows the whole file when it has an overview.
+        let (d0, d1) = v.data_range;
+        let ci = if d1 > d0 && t >= d0 && t < d1 {
+            ((((t - d0) / (d1 - d0)) * s.columns() as f64) as usize).min(s.columns() - 1)
+        } else {
+            usize::MAX
+        };
         let e = l.envelope;
-        let sx = if v.overview.is_some() && v.duration > 0.0 { e.x + (t / v.duration * e.w as f64) as i64 } else { x };
-        c.fill(sx, e.y, hair, e.h, WHITE, 0.35);
+        if v.sonar {
+            // The strip traces the spectrum at the pointer's time.
+            c.fill(x, e.y, hair, e.h, th.line, 0.35);
+            if ci < s.filled() {
+                let col = s.column(ci);
+                let range = (v.upper_db - v.lower_db) as f32;
+                let values: Vec<f32> = band_rows(p.w as usize, s.bands(), v)
+                    .into_iter()
+                    .map(|r| (band_db(col, r) - v.lower_db as f32) / range)
+                    .collect();
+                let color = quantize(self.lut.sample(1.0), 0, 0);
+                let thick = (1.5 * l.s).max(1.0) as i64;
+                trace_line(c, e, 3.0 * l.s, &values, color, 0.0, thick);
+            }
+        } else {
+            // The strip shows the whole file when it has an overview.
+            let sx =
+                if v.overview.is_some() && v.duration > 0.0 { e.x + (t / v.duration * e.w as f64) as i64 } else { x };
+            c.fill(sx, e.y, hair, e.h, th.line, 0.35);
+        }
         let mut parts = Vec::new();
         if v.duration > 0.0 {
             parts.push(format_time(t, true));
@@ -934,12 +1185,6 @@ impl Renderer {
         if v.sample_rate > 0 {
             parts.push(format_freq(f));
         }
-        let (d0, d1) = v.data_range;
-        let ci = if d1 > d0 && t >= d0 && t < d1 {
-            ((((t - d0) / (d1 - d0)) * s.columns() as f64) as usize).min(s.columns() - 1)
-        } else {
-            usize::MAX
-        };
         if ci < s.filled() && v.sample_rate > 0 {
             let band = math::round(f / nyquist * (s.bands() - 1) as f64) as usize;
             let db = s.column(ci)[band.min(s.bands() - 1)];
@@ -960,9 +1205,9 @@ impl Renderer {
             by = cy - 14.0 * l.s - h;
         }
         let rr = RoundRect { x: bx, y: by, w, h, r: h / 2.0 };
-        c.fill_round(rr, CARD, 0.92);
-        c.stroke_round(rr, l.hair, WHITE, 0.12);
-        self.text.draw(c, Weight::Semibold, px, (bx + pad, by + (h - lh) / 2.0), TEXT, &text);
+        c.fill_round(rr, th.card, 0.92);
+        c.stroke_round(rr, l.hair, th.line, 0.12);
+        self.text.draw(c, Weight::Semibold, px, (bx + pad, by + (h - lh) / 2.0), th.text, &text);
     }
 
     fn message(&mut self, c: &mut Canvas, l: &Layout, msg: &str) {
@@ -980,12 +1225,12 @@ impl Renderer {
         let room = (p.w as f32 - 24.0 * l.s).max(0.0);
         let first = self.text.fit(Weight::Semibold, big, first, room, true);
         let fw = self.text.width(Weight::Semibold, big, &first);
-        self.text.draw(c, Weight::Semibold, big, (cx - fw / 2.0, y), TEXT, &first);
+        self.text.draw(c, Weight::Semibold, big, (cx - fw / 2.0, y), self.theme.text, &first);
         y += bh + 4.0 * l.s;
         for line in rest {
             let line = self.text.fit(Weight::Regular, small, line, room, true);
             let w = self.text.width(Weight::Regular, small, &line);
-            self.text.draw(c, Weight::Regular, small, (cx - w / 2.0, y), TEXT_DIM, &line);
+            self.text.draw(c, Weight::Regular, small, (cx - w / 2.0, y), self.theme.dim, &line);
             y += sh;
         }
     }
@@ -1008,9 +1253,9 @@ impl Renderer {
         for k in keys.split("  ").filter(|k| !k.is_empty()) {
             let w = self.text.width(Weight::Semibold, px, k) + 2.0 * pad;
             let rr = RoundRect { x, y: top, w, h, r: 5.0 * l.s };
-            c.fill_round(rr, WHITE, 0.07);
-            c.stroke_round(rr, l.hair, WHITE, 0.16);
-            self.text.draw(c, Weight::Semibold, px, (x + pad, top + (h - lh) / 2.0), TEXT, k);
+            c.fill_round(rr, self.theme.line, 0.07);
+            c.stroke_round(rr, l.hair, self.theme.line, 0.16);
+            self.text.draw(c, Weight::Semibold, px, (x + pad, top + (h - lh) / 2.0), self.theme.text, k);
             x += w + gap;
         }
     }
@@ -1083,9 +1328,9 @@ impl Renderer {
             c.fill_round(rr, 0x000000, 0.07);
         }
         let card = RoundRect { x: px, y: py, w: pw, h: ph, r: 16.0 * s };
-        c.fill_round(card, CARD, 1.0);
-        c.stroke_round(card, l.hair, WHITE, 0.09);
-        self.text.draw(c, Weight::Semibold, title_px, (px + pad, py + pad - 4.0 * s), TEXT, panel.title);
+        c.fill_round(card, self.theme.card, 1.0);
+        c.stroke_round(card, l.hair, self.theme.line, 0.09);
+        self.text.draw(c, Weight::Semibold, title_px, (px + pad, py + pad - 4.0 * s), self.theme.text, panel.title);
 
         let lh = self.text.line_height(Weight::Regular, size);
         let mut x = px + pad;
@@ -1094,14 +1339,21 @@ impl Renderer {
             for sec in col {
                 if !sec.heading.is_empty() {
                     let hy = y + head_h - self.text.line_height(Weight::Semibold, head_px) - 8.0 * s;
-                    self.text.draw(c, Weight::Semibold, head_px, (x, hy), TEXT_FAINT, &sec.heading.to_uppercase());
+                    self.text.draw(
+                        c,
+                        Weight::Semibold,
+                        head_px,
+                        (x, hy),
+                        self.theme.faint,
+                        &sec.heading.to_uppercase(),
+                    );
                     y += head_h;
                 }
                 let indent = if has_keys(sec) { kw + key_gap } else { 0.0 };
                 for (k, d) in &sec.rows {
                     self.keycaps(c, l, k, (x, y), row_h);
                     let dx = x + indent;
-                    self.text.draw(c, Weight::Regular, size, (dx, y + (row_h - lh) / 2.0), TEXT_DIM, d);
+                    self.text.draw(c, Weight::Regular, size, (dx, y + (row_h - lh) / 2.0), self.theme.dim, d);
                     y += row_h;
                 }
             }
@@ -1110,7 +1362,7 @@ impl Renderer {
         if footer_h > 0.0 {
             let fw = self.text.width(Weight::Regular, footer_px, panel.footer);
             let fy = py + ph - pad + 8.0 * s - self.text.line_height(Weight::Regular, footer_px);
-            self.text.draw(c, Weight::Regular, footer_px, (px + (pw - fw) / 2.0, fy), TEXT_FAINT, panel.footer);
+            self.text.draw(c, Weight::Regular, footer_px, (px + (pw - fw) / 2.0, fy), self.theme.faint, panel.footer);
         }
     }
 }
@@ -1148,16 +1400,38 @@ mod tests {
 
     #[test]
     fn axes_round_trip() {
-        for scale in FreqScale::ALL {
-            for (time, freq) in [((0.0, 30.0), (0.0, 22050.0)), ((10.0, 14.0), (1000.0, 5000.0))] {
-                let a = Axes::new(1200, 700, 1.0, time, freq, scale);
-                let (x, y) = a.to_px(12.5, 3000.0);
-                assert!(a.contains(x, y));
-                let (t, f) = a.to_data(x, y);
-                assert!((t - 12.5).abs() < 0.05, "{scale:?} {t}");
-                assert!((f - 3000.0).abs() < 60.0, "{scale:?} {f}");
+        for waterfall in [false, true] {
+            for scale in FreqScale::ALL {
+                for (time, freq) in [((0.0, 30.0), (0.0, 22050.0)), ((10.0, 14.0), (1000.0, 5000.0))] {
+                    let a = Axes::new(1200, 700, 1.0, time, freq, scale, waterfall);
+                    let (x, y) = a.to_px(12.5, 3000.0);
+                    assert!(a.contains(x, y));
+                    let (t, f) = a.to_data(x, y);
+                    assert!((t - 12.5).abs() < 0.05, "{scale:?} {t}");
+                    assert!((f - 3000.0).abs() < 60.0, "{scale:?} {f}");
+                }
             }
         }
+    }
+
+    #[test]
+    fn waterfall_puts_time_up_and_frequency_across() {
+        let a = Axes::new(1200, 700, 1.0, (0.0, 10.0), (0.0, 20000.0), FreqScale::Linear, true);
+        let (x_low, y_old) = a.to_px(1.0, 1000.0);
+        let (x_high, y_new) = a.to_px(9.0, 19000.0);
+        assert!(x_high > x_low && y_new < y_old);
+        assert_eq!((a.time_len(), a.freq_len()), (a.plot.h, a.plot.w));
+    }
+
+    #[test]
+    fn waterfall_scrolls_with_the_front() {
+        let (time, data) = ((10.0, 20.0), (10.0, 20.0));
+        // Half done: the newest data sits at the top of the view.
+        assert_eq!(scrolled(true, time, data, 50, 100), (5.0, 15.0));
+        assert_eq!(scrolled(true, time, data, 100, 100), time);
+        assert_eq!(scrolled(false, time, data, 50, 100), time);
+        // Old data stretched over a new view does not scroll.
+        assert_eq!(scrolled(true, time, (0.0, 30.0), 50, 100), time);
     }
 
     #[test]

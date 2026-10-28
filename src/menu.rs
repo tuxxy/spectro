@@ -142,6 +142,7 @@ mod mac {
         /// Check items that mirror a setting: `(item, key, value)`.
         checks: Vec<(CheckMenuItem, &'static str, String)>,
         glow: CheckMenuItem,
+        sonar: CheckMenuItem,
         need_file: Vec<MenuItem>,
         need_selection: Vec<MenuItem>,
     }
@@ -191,6 +192,7 @@ mod mac {
                 })
                 .collect();
             let glow = CheckMenuItem::with_id(Action::Key('g').id(), "Glow", true, true, "G".parse().ok());
+            let sonar = CheckMenuItem::with_id(Action::Key('m').id(), "Submarine Mode", true, false, "M".parse().ok());
 
             let save = item(Action::Save, "Save Image\u{2026}", Some("CmdOrCtrl+S"));
             let reveal = item(Action::Reveal, "Show in Finder", Some("CmdOrCtrl+Shift+R"));
@@ -287,6 +289,7 @@ mod mac {
                     &size_menu,
                     &range_menu,
                     &glow,
+                    &sonar,
                     &sep(),
                     &next_channel,
                     &prev_channel,
@@ -321,6 +324,7 @@ mod mac {
                 recent_shown: None,
                 checks,
                 glow,
+                sonar,
                 need_file: vec![save, reveal],
                 need_selection: vec![play, clear, zoom_selection],
             }
@@ -340,6 +344,7 @@ mod mac {
                 c.set_checked(on);
             }
             self.glow.set_checked(s.glow);
+            self.sonar.set_checked(s.sonar);
             for i in &self.need_file {
                 i.set_enabled(st.has_file);
             }

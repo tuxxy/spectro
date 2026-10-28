@@ -15,6 +15,8 @@ pub struct Settings {
     pub lower_db: i32,
     pub glow: bool,
     pub freq_scale: FreqScale,
+    /// Submarine mode: a green sonar waterfall.
+    pub sonar: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             lower_db: DEFAULT_LOWER_DB,
             glow: true,
             freq_scale: FreqScale::default(),
+            sonar: false,
         }
     }
 }
@@ -62,14 +65,15 @@ impl Settings {
     pub fn save(&self) {
         let Some(p) = path() else { return };
         let text = format!(
-            "# spectro preferences\npalette={}\nwindow_function={}\nwindow_size={}\nupper_db={}\nlower_db={}\nglow={}\nfreq_scale={}\n",
+            "# spectro preferences\npalette={}\nwindow_function={}\nwindow_size={}\nupper_db={}\nlower_db={}\nglow={}\nfreq_scale={}\nsonar={}\n",
             self.palette.id(),
             self.window.id(),
             1u32 << self.fft_bits,
             self.upper_db,
             self.lower_db,
-            if self.glow { "on" } else { "off" },
-            self.freq_scale.id()
+            on_off(self.glow),
+            self.freq_scale.id(),
+            on_off(self.sonar)
         );
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -94,17 +98,8 @@ impl Settings {
             "upper_db" => value.parse().map(|v| self.upper_db = v).is_ok(),
             "lower_db" => value.parse().map(|v| self.lower_db = v).is_ok(),
             "freq_scale" => FreqScale::from_id(&value.to_ascii_lowercase()).map(|f| self.freq_scale = f).is_some(),
-            "glow" => match value {
-                "on" | "true" | "1" => {
-                    self.glow = true;
-                    true
-                }
-                "off" | "false" | "0" => {
-                    self.glow = false;
-                    true
-                }
-                _ => false,
-            },
+            "glow" => parse_on_off(value).map(|v| self.glow = v).is_some(),
+            "sonar" => parse_on_off(value).map(|v| self.sonar = v).is_some(),
             _ => false,
         };
         self.clamp();
@@ -131,11 +126,24 @@ impl Settings {
             'w' => self.fft_bits = (self.fft_bits + 1).min(MAX_FFT_BITS),
             'W' => self.fft_bits = (self.fft_bits - 1).max(MIN_FFT_BITS),
             'g' | 'G' => self.glow = !self.glow,
+            'm' | 'M' => self.sonar = !self.sonar,
             'y' => self.freq_scale = self.freq_scale.next(),
             'Y' => self.freq_scale = self.freq_scale.prev(),
             _ => return false,
         }
         true
+    }
+}
+
+fn on_off(v: bool) -> &'static str {
+    if v { "on" } else { "off" }
+}
+
+fn parse_on_off(v: &str) -> Option<bool> {
+    match v {
+        "on" | "true" | "1" => Some(true),
+        "off" | "false" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -161,5 +169,8 @@ mod tests {
         assert!(s.set("window_size", "256") && s.fft_bits == 8);
         assert!(!s.set("window_size", "300"));
         assert!(s.set("palette", "SoX") && s.palette == Palette::Sox);
+        assert!(s.set("sonar", "on") && s.sonar);
+        assert!(s.key('m') && !s.sonar);
+        assert!(!s.set("sonar", "maybe"));
     }
 }
