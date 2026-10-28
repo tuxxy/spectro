@@ -33,6 +33,34 @@ const MIN_FREQ_SPAN: f64 = 20.0;
 /// Frame interval for the playhead while a selection plays.
 const PLAYHEAD_FRAME: Duration = Duration::from_millis(33);
 
+/// Seconds shown up the waterfall when live playback starts unzoomed.
+const LIVE_SPAN: f64 = 20.0;
+/// Each live analysis chunk covers this many spans: one behind the playing
+/// time and the rest ahead of it.
+const LIVE_CHUNK: f64 = 4.0;
+/// Frame interval while playing live.
+const LIVE_FRAME: Duration = Duration::from_millis(16);
+
+/// Live playback in submarine mode: the waterfall follows what is heard.
+struct Live {
+    player: Player,
+    /// File seconds where `player` started.
+    from: f64,
+    /// The band being heard, if narrowed.
+    band: Option<(f64, f64)>,
+    /// Seconds shown up the waterfall.
+    span: f64,
+    /// The next analysis chunk, shown once it reaches the playing time.
+    next: Option<Job>,
+}
+
+/// The seconds a job has analysed up to.
+fn job_front(j: &Job) -> f64 {
+    let r = &j.request;
+    let filled = j.shared.lock().map_or(0, |s| s.spectrogram.filled());
+    r.t0 + (r.t1 - r.t0) * filled as f64 / r.columns.max(1) as f64
+}
+
 pub enum UserEvent {
     Progress,
     Open(PathBuf),
@@ -85,6 +113,7 @@ struct App {
     zoom_freq: Option<(f64, f64)>,
     /// Loudness of the whole file, kept from the last full analysis.
     overview: Option<Vec<Envelope>>,
+    live: Option<Live>,
 }
 
 pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: usize) -> Result<(), String> {
@@ -114,6 +143,7 @@ pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: us
         zoom_time: None,
         zoom_freq: None,
         overview: None,
+        live: None,
     };
     if let Some(f) = file {
         app.load(f, stream, channel);
@@ -145,6 +175,7 @@ impl App {
             self.channel = self.channel.min(ch - 1);
         }
         self.status = None;
+        self.live = None;
         self.clear_selection();
         self.zoom_time = None;
         self.zoom_freq = None;
@@ -197,6 +228,9 @@ impl App {
     }
 
     fn time_range(&self) -> (f64, f64) {
+        if let (Some(l), Some(now)) = (&self.live, self.live_now()) {
+            return (now - l.span, now);
+        }
         self.zoom_time.unwrap_or((0.0, self.duration()))
     }
 
@@ -228,8 +262,15 @@ impl App {
         self.redraw_later();
     }
 
-    /// Scales the time span by `factor` (below 1 zooms in) around `anchor` seconds.
+    /// Scales the time span by `factor` (below 1 zooms in) around `anchor`
+    /// seconds; while live, around the playing time.
     fn zoom_time_by(&mut self, factor: f64, anchor: f64) {
+        let dur = self.duration();
+        if let Some(l) = &mut self.live {
+            l.span = (l.span * factor).clamp(1.0, dur.max(1.0));
+            self.redraw_later();
+            return;
+        }
         let (t0, t1) = self.time_range();
         let span = (t1 - t0) * factor;
         let k = if t1 > t0 { (anchor - t0) / (t1 - t0) } else { 0.5 };
@@ -328,7 +369,13 @@ impl App {
                 self.drag = None;
                 let end = self.cursor.unwrap_or(start);
                 let min = 4.0 * self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor() as f32);
-                if (end.0 - start.0).abs() < min || (end.1 - start.1).abs() < min {
+                if let (Some(now), Some(l)) = (self.live_now(), &self.live) {
+                    // While live, a box picks the band to hear; a click hears all.
+                    let band = region.filter(|_| (end.0 - start.0).abs() >= min).map(|r| (r.f0, r.f1));
+                    if band != l.band {
+                        self.play_live(now, band, l.span);
+                    }
+                } else if (end.0 - start.0).abs() < min || (end.1 - start.1).abs() < min {
                     self.clear_selection();
                 } else {
                     self.selection = region;
@@ -363,10 +410,22 @@ impl App {
     fn restart(&mut self) {
         self.restart_at = None;
         self.job = None;
-        let columns = self.columns();
-        let (Some(path), Some(s)) = (self.path.clone(), self.current().cloned()) else { return };
-        if columns == 0 || s.problem().is_some() {
+        if let Some(l) = &mut self.live {
+            l.next = None;
+            self.live_tick();
+            self.redraw_later();
             return;
+        }
+        let (t0, t1) = self.time_range();
+        self.job = self.spawn_job(t0, t1, self.columns());
+        self.redraw_later();
+    }
+
+    /// Starts analysing `t0..t1` seconds of the current stream into `columns`.
+    fn spawn_job(&self, t0: f64, t1: f64, columns: usize) -> Option<Job> {
+        let (Some(path), Some(s)) = (self.path.clone(), self.current()) else { return None };
+        if columns == 0 || s.problem().is_some() {
+            return None;
         }
         let req = Request {
             path,
@@ -375,17 +434,96 @@ impl App {
             channels: s.channels as usize,
             sample_rate: s.sample_rate,
             samples: s.samples(),
-            t0: self.time_range().0,
-            t1: self.time_range().1,
+            t0,
+            t1,
             fft_bits: self.settings.fft_bits,
             window: self.settings.window,
             columns,
         };
         let proxy = self.proxy.clone();
-        self.job = Some(Job::spawn(req, move || {
+        Some(Job::spawn(req, move || {
             let _ = proxy.send_event(UserEvent::Progress);
-        }));
+        }))
+    }
+
+    /// The file time being heard while playing live.
+    fn live_now(&self) -> Option<f64> {
+        let l = self.live.as_ref()?;
+        Some(l.player.clock().unwrap_or(l.from).clamp(0.0, self.duration()))
+    }
+
+    /// Plays from the top of the view (or the start of the file, when the
+    /// whole file is shown) with the waterfall following.
+    fn start_live(&mut self) {
+        let dur = self.duration();
+        if dur <= 0.0 || self.current().is_none_or(|s| s.problem().is_some()) {
+            return;
+        }
+        if !self.settings.sonar {
+            self.change_settings(|s| {
+                s.sonar = true;
+                true
+            });
+        }
+        let (t0, t1) = self.time_range();
+        let zoomed = self.zoom_time.is_some();
+        let span = if zoomed { (t1 - t0).max(1.0) } else { LIVE_SPAN.min(dur) };
+        let from = if zoomed && t1 < dur - 0.5 { t1 } else { 0.0 };
+        self.clear_selection();
+        self.play_live(from, None, span);
+    }
+
+    /// (Re)starts live playback at `from` seconds, keeping only `band`.
+    fn play_live(&mut self, from: f64, band: Option<(f64, f64)>, span: f64) {
+        let Some(path) = self.path.clone() else { return };
+        let nyquist = self.nyquist();
+        // Stop the old player before the new one starts; keep its chunk.
+        let next = self.live.take().and_then(|l| l.next);
+        match Player::live(&path, self.stream, from, band.unwrap_or((0.0, nyquist)), nyquist) {
+            Ok(player) => self.live = Some(Live { player, from, band, span, next }),
+            Err(e) => self.status = Some(e),
+        }
+        self.restart_at = None;
+        self.live_tick();
+        self.sync_menu();
         self.redraw_later();
+    }
+
+    /// Stops live playback, leaving the view where it was.
+    fn stop_live(&mut self) {
+        let (Some(now), Some(l)) = (self.live_now(), self.live.take()) else { return };
+        self.set_time_range(now - l.span, now);
+        self.sync_menu();
+    }
+
+    /// Keeps an analysis chunk ahead of live playback, and swaps in the next
+    /// one once it has caught up with the playing time.
+    fn live_tick(&mut self) {
+        let (Some(now), Some(axes)) = (self.live_now(), self.axes()) else { return };
+        let Some(l) = &mut self.live else { return };
+        let span = l.span;
+        if let Some(next) = &l.next
+            && (self.job.is_none() || job_front(next) >= now.min(next.request.t1) - 1e-6)
+        {
+            self.job = l.next.take();
+        }
+        let pending = l.next.is_some();
+        // One column per pixel row, from a span behind to a span ahead.
+        let dt = span / axes.time_len().max(1) as f64;
+        let (lo, hi) = ((now - span).max(0.0), (now + span).min(self.duration()));
+        let good = self.job.as_ref().is_some_and(|j| {
+            let r = &j.request;
+            let ratio = (r.t1 - r.t0) / r.columns.max(1) as f64 / dt;
+            r.t0 <= lo + 1e-6 && r.t1 >= hi - 1e-6 && (0.67..1.5).contains(&ratio)
+        });
+        if !good && !pending {
+            let t1 = (now + (LIVE_CHUNK - 1.0) * span).min(self.duration());
+            let columns = ((t1 - lo) / dt).ceil() as usize;
+            let job = self.spawn_job(lo, t1, columns);
+            if let Some(l) = &mut self.live {
+                l.next = job;
+            }
+        }
     }
 
     fn redraw_later(&mut self) {
@@ -453,6 +591,9 @@ impl App {
                                 row("Drag", "Select a region: it loops, filtered to its band"),
                                 row("Space", "Stop or restart the loop"),
                                 row("Click  Esc", "Clear the selection"),
+                                row("Return", "Play live in submarine mode; the waterfall follows"),
+                                row("Drag", "While live: hear only that band (click for all)"),
+                                row("Up  Down", "While live: jump ahead or back"),
                             ],
                         ),
                         section(
@@ -476,6 +617,7 @@ impl App {
                                     row("", "The newest moment is at the top, as on a sonar"),
                                     row("", "The strip on top traces the spectrum shown"),
                                     row("", "Hover to trace one moment and read its level"),
+                                    row("", "Playing live, the top is now and the strip traces it"),
                                 ]
                             } else {
                                 vec![
@@ -564,6 +706,11 @@ impl App {
         let panel = self.panel_content();
         // Before the lock below: the dragged region reads the analysis too.
         let region = self.dragged_region().or(self.selection);
+        let band = match &self.live {
+            Some(_) if self.drag.is_some() => region.map(|r| (r.f0, r.f1)),
+            Some(l) => l.band,
+            None => None,
+        };
         let job = self.job.as_ref().map(|j| j.shared.clone());
         let guard = job.as_ref().and_then(|j| j.lock().ok());
         let spec = guard.as_ref().map(|g| &g.spectrogram);
@@ -577,13 +724,19 @@ impl App {
         v.message = message.as_deref();
         v.panel = panel.as_ref().map(|(title, sections)| RenderPanel { title, sections, footer: "Esc to close" });
         v.cursor = if self.panel == Panel::None && self.drag.is_none() { self.cursor } else { None };
-        v.selection = region.map(|r| Selection {
-            t0: r.t0,
-            t1: r.t1,
-            f0: r.f0,
-            f1: r.f1,
-            playhead: self.player.as_ref().filter(|_| self.drag.is_none()).map(Player::position),
-        });
+        v.live = self.live.is_some();
+        v.selection = if v.live {
+            band.map(|(f0, f1)| Selection { t0: 0.0, t1: 0.0, f0, f1, playhead: None, band: true })
+        } else {
+            region.map(|r| Selection {
+                t0: r.t0,
+                t1: r.t1,
+                f0: r.f0,
+                f1: r.f1,
+                playhead: self.player.as_ref().filter(|_| self.drag.is_none()).map(Player::position),
+                band: false,
+            })
+        };
         if base_only {
             self.renderer.render_base(canvas, &v);
         } else {
@@ -646,6 +799,7 @@ impl App {
             Key::Named(NamedKey::F1) => Action::Help,
             Key::Named(NamedKey::Escape) => Action::ClearSelection,
             Key::Named(NamedKey::Space) => Action::TogglePlay,
+            Key::Named(NamedKey::Enter) => Action::Live,
             Key::Named(NamedKey::ArrowLeft) => Action::Pan(-2),
             Key::Named(NamedKey::ArrowRight) => Action::Pan(2),
             // In submarine mode time runs up the screen.
@@ -690,6 +844,9 @@ impl App {
             return;
         }
         self.settings.save();
+        if before.sonar && !self.settings.sonar {
+            self.stop_live();
+        }
         let analysis = before.fft_bits != self.settings.fft_bits || before.window != self.settings.window;
         // Submarine mode turns the time axis, which changes the column count.
         if analysis || before.sonar != self.settings.sonar {
@@ -736,11 +893,22 @@ impl App {
             Action::About => self.toggle_panel(Panel::About),
             Action::Settings => self.toggle_panel(Panel::Settings),
             Action::Help => self.toggle_panel(Panel::Help),
-            Action::TogglePlay => {
-                if self.selection.is_none() {
-                    return;
+            Action::Live => {
+                if self.live.is_some() {
+                    self.stop_live();
+                } else {
+                    self.start_live();
                 }
-                if self.player.is_some() {
+            }
+            Action::TogglePlay => {
+                if self.live.is_some() {
+                    self.stop_live();
+                } else if self.selection.is_none() {
+                    // In submarine mode, Space with nothing selected plays live.
+                    if self.settings.sonar {
+                        self.start_live();
+                    }
+                } else if self.player.is_some() {
                     self.player = None;
                 } else {
                     self.play();
@@ -749,6 +917,11 @@ impl App {
             Action::ClearSelection => {
                 if self.panel != Panel::None {
                     self.panel = Panel::None;
+                } else if let (Some(now), Some(l)) = (self.live_now(), &self.live) {
+                    // Hear the whole band again.
+                    if l.band.is_some() {
+                        self.play_live(now, None, l.span);
+                    }
                 } else {
                     self.clear_selection();
                     self.status = None;
@@ -760,14 +933,29 @@ impl App {
             Action::ZoomReset => {
                 self.zoom_freq = None;
                 let dur = self.duration();
+                if let Some(l) = &mut self.live {
+                    l.span = LIVE_SPAN.min(dur.max(1.0));
+                    return self.redraw_later();
+                }
+                let dur = self.duration();
                 self.set_time_range(0.0, dur);
             }
             Action::ZoomToSelection => {
+                if let Some((f0, f1)) = self.live.as_ref().and_then(|l| l.band) {
+                    return self.set_freq_range(f0, f1);
+                }
                 let Some(r) = self.selection else { return };
                 self.set_time_range(r.t0, r.t1);
                 self.set_freq_range(r.f0, r.f1);
             }
             Action::Pan(n) => {
+                // While live, jump ahead or back.
+                if let (Some(now), Some(l)) = (self.live_now(), &self.live) {
+                    let to = (now + l.span * n as f64 / 10.0).clamp(0.0, (self.duration() - 0.1).max(0.0));
+                    let (band, span) = (l.band, l.span);
+                    self.play_live(to, band, span);
+                    return;
+                }
                 let (t0, t1) = self.time_range();
                 let dt = (t1 - t0) * n as f64 / 10.0;
                 self.set_time_range(t0 + dt, t1 + dt);
@@ -783,6 +971,7 @@ impl App {
                         self.restart();
                     }
                     's' | 'S' if streams > 0 => {
+                        self.live = None;
                         self.clear_selection();
                         self.zoom_time = None;
                         self.zoom_freq = None;
@@ -924,8 +1113,8 @@ impl ApplicationHandler<UserEvent> for App {
             self.restart();
             wake = None;
         }
-        if let Some(running) = self.player.as_mut().map(Player::running) {
-            if running {
+        if let Some(finished) = self.player.as_mut().map(Player::finished) {
+            if finished.is_none() {
                 // Animate the playhead.
                 self.redraw_cursor();
                 let next = now + PLAYHEAD_FRAME;
@@ -935,6 +1124,22 @@ impl ApplicationHandler<UserEvent> for App {
                 self.status = Some("Playback stopped: ffplay could not play this region".into());
                 self.redraw_later();
             }
+        }
+        match self.live.as_mut().map(|l| l.player.finished()) {
+            Some(None) => {
+                // Scroll with the sound.
+                self.live_tick();
+                self.redraw_later();
+                let next = now + LIVE_FRAME;
+                wake = Some(wake.map_or(next, |w| w.min(next)));
+            }
+            Some(Some(ended)) => {
+                if !ended {
+                    self.status = Some("Live playback stopped: ffplay could not play this file".into());
+                }
+                self.stop_live();
+            }
+            None => {}
         }
         event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }

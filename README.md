@@ -75,6 +75,14 @@ arrives. The strip on top becomes a line trace of the spectrum shown, and
 hovering traces the spectrum of the moment under the pointer. Scroll
 vertically, or use Up and Down, to move in time.
 
+Press `Return` (or `Space` with nothing selected) to play live: the sound
+starts from the top of the view (or the start of the file) and the
+waterfall scrolls with it, kept in step with what you hear. The top edge is
+now, and the strip traces the spectrum being heard. Drag a box across some
+frequencies to hear only that band as it plays; click, or press `Esc`, to
+hear everything again. Up and Down jump ahead or back, zooming changes how
+much history is shown, and `Return` or `Space` stops.
+
 ![A ship-like sound in submarine mode: engine tones and their harmonics wandering at the left, a steady 1.25 kHz line, and sonar pings at 3.5 kHz every six seconds](docs/sonar.png)
 
 ## Install
@@ -114,7 +122,7 @@ On macOS spectro has a native menu bar:
 - **File**: Open, Open Recent, Save Image, Show in Finder, Close Window.
 - **View**: zoom in, zoom out, zoom to selection, show whole file, palette, frequency scale, window function, window size, dynamic
   range, glow, submarine mode, channel and stream. The current choices are checked.
-- **Playback**: play, stop or clear the selected region.
+- **Playback**: play live, and play, stop or clear the selected region.
 - **Window** and **Help**.
 
 On every platform, `F1` opens a help screen listing everything spectro can
@@ -151,6 +159,7 @@ On macOS use Cmd instead of Ctrl.
 | `y`, `Y` | Change the frequency scale (linear, mel, logarithmic) |
 | `g` | Turn the glow on or off |
 | `m` | Turn submarine mode on or off |
+| `Return` | Play live in submarine mode, or stop |
 | `Esc` | Close a panel, or clear the selection |
 
 The ten most recent files are listed in File > Open Recent. Palette,

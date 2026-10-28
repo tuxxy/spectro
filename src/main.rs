@@ -58,6 +58,8 @@ Keys: Ctrl-O open, Ctrl-S save, Ctrl-E settings, F1 help (Cmd on macOS).
   c/C channel  s/S stream  p/P palette  f/F window function
   w/W window size  u/U upper limit  l/L lower limit
   y/Y frequency scale  g glow  m submarine mode
+  Return plays live in submarine mode: the waterfall follows the sound, and
+  a box dragged across some frequencies plays just that band.
 Mouse: drag a box to loop that region, filtered to its band; Space stops
 or restarts it; a click or Esc clears it. Zoom with a pinch, Cmd/Ctrl-scroll,
 + and -, or Z for the selected box; scroll to move; 0 shows everything.
@@ -205,6 +207,7 @@ pub fn view<'a>(
         cursor: None,
         selection: None,
         sonar: settings.sonar,
+        live: false,
     }
 }
 

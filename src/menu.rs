@@ -26,6 +26,8 @@ pub enum Action {
     /// Sets a preference directly, e.g. `("palette", "glacier")`.
     Set(String, String),
     TogglePlay,
+    /// Starts or stops live playback in submarine mode.
+    Live,
     ClearSelection,
     ZoomIn,
     ZoomOut,
@@ -51,6 +53,7 @@ impl Action {
             Action::Key(c) => format!("key:{c}"),
             Action::Set(k, v) => format!("set:{k}:{v}"),
             Action::TogglePlay => "play".into(),
+            Action::Live => "live".into(),
             Action::ClearSelection => "clear-selection".into(),
             Action::ZoomIn => "zoom-in".into(),
             Action::ZoomOut => "zoom-out".into(),
@@ -71,6 +74,7 @@ impl Action {
             "settings" => Action::Settings,
             "help" => Action::Help,
             "play" => Action::TogglePlay,
+            "live" => Action::Live,
             "clear-selection" => Action::ClearSelection,
             "zoom-in" => Action::ZoomIn,
             "zoom-out" => Action::ZoomOut,
@@ -197,6 +201,7 @@ mod mac {
             let save = item(Action::Save, "Save Image\u{2026}", Some("CmdOrCtrl+S"));
             let reveal = item(Action::Reveal, "Show in Finder", Some("CmdOrCtrl+Shift+R"));
             let play = item(Action::TogglePlay, "Play / Stop Loop", Some("Space"));
+            let live = item(Action::Live, "Play Live / Stop", Some("Enter"));
             let clear = item(Action::ClearSelection, "Clear Selection", None);
 
             let app = submenu(
@@ -297,7 +302,7 @@ mod mac {
                     &prev_stream,
                 ],
             );
-            let playback = submenu("Playback", &[&play, &clear]);
+            let playback = submenu("Playback", &[&live, &sep(), &play, &clear]);
             let window = submenu(
                 "Window",
                 &[
@@ -325,7 +330,7 @@ mod mac {
                 checks,
                 glow,
                 sonar,
-                need_file: vec![save, reveal],
+                need_file: vec![save, reveal, live],
                 need_selection: vec![play, clear, zoom_selection],
             }
         }

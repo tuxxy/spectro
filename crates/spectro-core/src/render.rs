@@ -197,6 +197,9 @@ pub struct View<'a> {
     /// runs, the picture scrolls down as it arrives. The strip above shows
     /// the spectrum, as a sonar's line trace.
     pub sonar: bool,
+    /// Live playback in submarine mode: the top of the plot is the moment
+    /// being heard, and the strip traces its spectrum.
+    pub live: bool,
 }
 
 impl View<'_> {
@@ -242,6 +245,9 @@ pub struct Selection {
     pub f1: f64,
     /// Seconds into the region where playback is, if it is playing.
     pub playhead: Option<f64>,
+    /// Only the band matters, as when filtering live playback: the region
+    /// covers the whole time axis.
+    pub band: bool,
 }
 
 /// A rectangle in device pixels.
@@ -682,7 +688,11 @@ impl Renderer {
 
     fn header(&mut self, c: &mut Canvas, l: &Layout, v: &View, w: f32) {
         let s = l.s;
-        let mark = if v.sonar { "spectro sonar" } else { "spectro" };
+        let mark = match (v.sonar, v.live) {
+            (true, true) => "spectro sonar \u{b7} live",
+            (true, false) => "spectro sonar",
+            _ => "spectro",
+        };
         let mw = self.text.width(Weight::Semibold, 13.0 * s, mark);
         let mark_x = w - l.margin - mw;
         let title_base = l.title_y + self.text.ascent(Weight::Semibold, l.title_px);
@@ -858,6 +868,18 @@ impl Renderer {
         for t in &mut self.trace {
             *t /= count.max(1) as f32;
         }
+        if v.live {
+            // The spectrum being heard: the newest few rows, for steadiness.
+            let newest: Vec<usize> = (0..nt).rev().filter(|&i| map[i].is_some()).take(3).collect();
+            let level = |i: usize, k: usize| {
+                let (x, y) = at(i, k);
+                self.levels[y * pw + x]
+            };
+            for (k, t) in self.trace.iter_mut().enumerate() {
+                let sum: f32 = newest.iter().map(|&i| level(i, k)).sum();
+                *t = (sum / newest.len().max(1) as f32).clamp(0.0, 1.0);
+            }
+        }
 
         // Bloom: bright parts, blurred at reduced resolution (half, or a
         // quarter on a 2x display, which looks the same), screened back on.
@@ -931,10 +953,17 @@ impl Renderer {
             }
         }
 
-        // Progress scanline at the analysis front, fading over the older side.
-        if s.filled() < s.columns() {
-            let (d0, d1) = v.data_range;
-            let front = d0 + (d1 - d0) * s.filled() as f64 / s.columns() as f64;
+        // A scanline at the analysis front, or at the moment being heard,
+        // fading over the older side.
+        let (d0, d1) = v.data_range;
+        let front = if v.live {
+            Some(v.time_range.1)
+        } else if s.filled() < s.columns() {
+            Some(d0 + (d1 - d0) * s.filled() as f64 / s.columns() as f64)
+        } else {
+            None
+        };
+        if let Some(front) = front {
             let (t0, t1) = v.time_range;
             let u = (front - t0) / (t1 - t0);
             let accent = self.lut.sample(0.92);
@@ -1128,8 +1157,9 @@ impl Renderer {
     fn selection(&mut self, c: &mut Canvas, l: &Layout, v: &View, sel: Selection) {
         let p = l.plot;
         let axes = Axes::of(p, v);
-        let (xa, ya) = axes.to_px(sel.t0, sel.f0);
-        let (xb, yb) = axes.to_px(sel.t1, sel.f1);
+        let (t0, t1) = if sel.band { v.time_range } else { (sel.t0, sel.t1) };
+        let (xa, ya) = axes.to_px(t0, sel.f0);
+        let (xb, yb) = axes.to_px(t1, sel.f1);
         let cx = |x: f32| (x as i64).clamp(p.x, p.x + p.w);
         let cy = |y: f32| (y as i64).clamp(p.y, p.y + p.h);
         let (x0, y0) = (cx(xa.min(xb)), cy(ya.min(yb)));
@@ -1165,13 +1195,17 @@ impl Renderer {
 
         let (t0, t1) = (sel.t0.min(sel.t1), sel.t0.max(sel.t1));
         let (f0, f1) = (sel.f0.min(sel.f1), sel.f0.max(sel.f1));
-        let mut text = format!(
-            "{} \u{2013} {}   {} \u{2013} {}",
-            format_time(t0, true),
-            format_time(t1, true),
-            format_freq(f0),
-            format_freq(f1)
-        );
+        let mut text = if sel.band {
+            format!("{} \u{2013} {}   Listening", format_freq(f0), format_freq(f1))
+        } else {
+            format!(
+                "{} \u{2013} {}   {} \u{2013} {}",
+                format_time(t0, true),
+                format_time(t1, true),
+                format_freq(f0),
+                format_freq(f1)
+            )
+        };
         if sel.playhead.is_some() {
             text.push_str("   Looping");
         }
