@@ -50,7 +50,7 @@ spectrograms around.
     look sharp. Spek takes one FFT per window length and averages in dB.
   - Levels are true dBFS: a full-scale sine reads 0 dB for every window
     function.
-  - New palettes (Ember, the default, plus Glacier and Aurora) are designed
+  - New palettes (Ember, the default, plus Glacier, Aurora and Sonar) are designed
     in OKLab and spaced so equal steps in level look like equal steps in
     colour. Lightness only ever rises, so they also read in greyscale.
     Spek's Spectrum, SoX and Mono palettes are kept exactly.
@@ -65,6 +65,17 @@ spectrograms around.
 | Spectrum palette, no glow (Spek's colours) | Glacier palette, mel axis |
 | --- | --- |
 | ![The same track with the Spectrum palette](docs/spectrum.png) | ![The same track with the Glacier palette on a mel axis](docs/glacier.png) |
+
+### Submarine mode
+
+Press `m` (or start with `--sonar`) for a sonar waterfall in green
+phosphor. Frequency runs across and time runs down, with the newest moment
+at the top. While the analysis runs, the picture scrolls down as it
+arrives. The strip on top becomes a line trace of the spectrum shown, and
+hovering traces the spectrum of the moment under the pointer. Scroll
+vertically, or use Up and Down, to move in time.
+
+![A ship-like sound in submarine mode: engine tones and their harmonics wandering at the left, a steady 1.25 kHz line, and sonar pings at 3.5 kHz every six seconds](docs/sonar.png)
 
 ## Install
 
@@ -102,7 +113,7 @@ function, window size and dynamic range.
 On macOS spectro has a native menu bar:
 - **File**: Open, Open Recent, Save Image, Show in Finder, Close Window.
 - **View**: zoom in, zoom out, zoom to selection, show whole file, palette, frequency scale, window function, window size, dynamic
-  range, glow, channel and stream. The current choices are checked.
+  range, glow, submarine mode, channel and stream. The current choices are checked.
 - **Playback**: play, stop or clear the selected region.
 - **Window** and **Help**.
 
@@ -139,10 +150,11 @@ On macOS use Cmd instead of Ctrl.
 | `l`, `L` | Change the lower limit of the dynamic range in dBFS |
 | `y`, `Y` | Change the frequency scale (linear, mel, logarithmic) |
 | `g` | Turn the glow on or off |
+| `m` | Turn submarine mode on or off |
 | `Esc` | Close a panel, or clear the selection |
 
 The ten most recent files are listed in File > Open Recent. Palette,
-window function, window size, range, frequency scale and glow are saved in
+window function, window size, range, frequency scale, glow and submarine mode are saved in
 `~/.config/spectro/preferences` (or `$XDG_CONFIG_HOME`, or `%APPDATA%` on
 Windows).
 
@@ -155,7 +167,7 @@ Windows).
 - The picture is redesigned (see above). For Spek's colours, use
   `-p spectrum --glow off`, or press `p` and `g`.
 - Extra: zoom, listening to a selected region, the hover readout, the loudness waveform, the frequency scales,
-  the glow, three new palettes, and `--output` with the other command-line
+  the glow, submarine mode, four new palettes, and `--output` with the other command-line
   options.
 
 ## Layout
