@@ -33,12 +33,13 @@ const CARD: u32 = 0x17181f;
 /// How frequency maps to height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FreqScale {
-    /// Perceptual: close to linear at low frequencies, logarithmic above
-    /// about 1 kHz. Music fills the picture and codec cutoffs stay visible.
+    /// Equal height per hertz, as in Spek. Best for the top octave, where
+    /// encoder cutoffs and resampling show.
     #[default]
-    Mel,
-    /// Spek's scale: equal height per hertz.
     Linear,
+    /// Perceptual: close to linear at low frequencies, logarithmic above
+    /// about 1 kHz. Music fills the picture; the top octave gets compressed.
+    Mel,
     /// Equal height per octave, from 20 Hz.
     Log,
 }
@@ -50,7 +51,7 @@ fn mel(f: f64) -> f64 {
 }
 
 impl FreqScale {
-    pub const ALL: [FreqScale; 3] = [FreqScale::Mel, FreqScale::Linear, FreqScale::Log];
+    pub const ALL: [FreqScale; 3] = [FreqScale::Linear, FreqScale::Mel, FreqScale::Log];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -610,7 +611,12 @@ impl Renderer {
                     out
                 }
             };
-            let top = values.iter().copied().filter(|&f| f > 0.0).fold(0.0, f64::max);
+            // The top edge is always labelled with the true maximum (the
+            // Nyquist frequency), so the full range is visible at a glance.
+            let mut values: Vec<f64> =
+                values.into_iter().filter(|&f| (1.0 - scale.frac(f, nyquist)) * p.h as f64 >= gap).collect();
+            values.push(nyquist);
+            let top = nyquist;
             for &f in &values {
                 let y = (p.y + p.h) as f64 - scale.frac(f, nyquist).max(0.0) * p.h as f64;
                 if f > 0.0 && f < nyquist {
@@ -645,7 +651,10 @@ impl Renderer {
                 if t > 0.0 && t < v.duration {
                     c.fill(math::round(x) as i64, p.y, hair, p.h, WHITE, 0.07);
                 }
-                let label = format_time(t, step < 1.0);
+                let mut label = format_time(t, step < 1.0);
+                if step < 1.0 {
+                    label.pop(); // steps are tenths, so show one decimal
+                }
                 let tw = self.text.width(Weight::Regular, l.label_px, &label);
                 let lx = (x as f32 - tw / 2.0).max(p.x as f32);
                 if lx + tw > (p.x + p.w) as f32 + 2.0 * s {

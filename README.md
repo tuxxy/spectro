@@ -26,10 +26,11 @@ spectrograms around.
   scanline sweeps across while it is analysed. Hover to get a crosshair
   that reads out time, frequency and level.
 - **Better pictures.**
-  - The frequency axis is perceptual (mel) by default: chords, melodies and
-    harmonics get room instead of being squeezed into the bottom fifth,
-    and encoder cutoffs still show at the top. Press `y` for Spek's linear
-    axis or a logarithmic one.
+  - The frequency axis is linear to the Nyquist frequency (22.05 kHz for
+    44.1 kHz audio), which is right for checking encoder cutoffs. The top
+    edge is always labelled with the true maximum. Press `y` for a
+    perceptual (mel) axis that gives chords, melodies and harmonics room,
+    or a logarithmic one.
   - Loud components glow softly (bloom). Press `g` to turn it off.
   - Each column averages the power of up to 24 overlapping windowed FFTs
     across its time slice (Welch's method), so noise looks smooth and tones
@@ -48,9 +49,9 @@ spectrograms around.
   - Sharp, anti-aliased text and lines at any display scale, including
     Retina/HiDPI, using embedded Source Sans 3 outlines.
 
-| Spek's look: Spectrum palette, linear axis, no glow | Glacier palette |
+| Spectrum palette, no glow (Spek's colours) | Glacier palette, mel axis |
 | --- | --- |
-| ![The same track with the Spectrum palette and a linear axis](docs/spectrum.png) | ![The same track with the Glacier palette](docs/glacier.png) |
+| ![The same track with the Spectrum palette](docs/spectrum.png) | ![The same track with the Glacier palette on a mel axis](docs/glacier.png) |
 
 ## Install
 
@@ -99,7 +100,7 @@ On macOS use Cmd instead of Ctrl.
 | `w`, `W` | Change the DFT window size (256 to 16384) |
 | `u`, `U` | Change the upper limit of the dynamic range in dBFS |
 | `l`, `L` | Change the lower limit of the dynamic range in dBFS |
-| `y`, `Y` | Change the frequency scale (mel, linear, logarithmic) |
+| `y`, `Y` | Change the frequency scale (linear, mel, logarithmic) |
 | `g` | Turn the glow on or off |
 | `Esc` | Close a panel |
 
@@ -114,8 +115,8 @@ Windows).
 - `Ctrl-E` shows the current settings. Spek's preferences dialog sets the
   language and update checks; spectro is English only and never uses the
   network.
-- The picture is redesigned (see above). For Spek's look, use
-  `-p spectrum --freq-scale linear --glow off`, or press `p`, `y` and `g`.
+- The picture is redesigned (see above). For Spek's colours, use
+  `-p spectrum --glow off`, or press `p` and `g`.
 - Extra: the hover readout, the loudness waveform, the frequency scales,
   the glow, three new palettes, and `--output` with the other command-line
   options.

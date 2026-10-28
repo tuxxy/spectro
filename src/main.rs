@@ -43,7 +43,7 @@ Options:
   -u, --upper DB              upper limit of the dynamic range in dBFS
   -l, --lower DB              lower limit of the dynamic range in dBFS
       --glow on|off           let loud components bloom (default on)
-      --freq-scale NAME       mel (default), linear or log
+      --freq-scale NAME       linear (default), mel or log
   -h, --help                  show this help and exit
   -V, --version               show the version and exit
 
