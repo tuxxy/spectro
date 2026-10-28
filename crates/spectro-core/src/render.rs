@@ -134,6 +134,19 @@ pub struct View<'a> {
     pub freq_scale: FreqScale,
     /// Pointer position in device pixels, for the crosshair readout.
     pub cursor: Option<(f32, f32)>,
+    /// A selected time and frequency region, e.g. for looped playback.
+    pub selection: Option<Selection>,
+}
+
+/// A region of the spectrogram in seconds and hertz.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Selection {
+    pub t0: f64,
+    pub t1: f64,
+    pub f0: f64,
+    pub f1: f64,
+    /// Seconds into the region where playback is, if it is playing.
+    pub playhead: Option<f64>,
 }
 
 /// A rectangle in device pixels.
@@ -213,6 +226,45 @@ fn layout(width: usize, height: usize, scale: f32) -> Layout {
 /// number of spectrogram columns to compute.
 pub fn plot_rect(width: usize, height: usize, scale: f32) -> Plot {
     layout(width, height, scale).plot
+}
+
+/// Converts between device pixels and seconds/hertz on the plot.
+#[derive(Clone, Copy, Debug)]
+pub struct Axes {
+    pub plot: Plot,
+    duration: f64,
+    nyquist: f64,
+    scale: FreqScale,
+}
+
+impl Axes {
+    pub fn new(width: usize, height: usize, ui_scale: f32, duration: f64, sample_rate: u32, scale: FreqScale) -> Self {
+        Axes { plot: plot_rect(width, height, ui_scale), duration, nyquist: sample_rate as f64 / 2.0, scale }
+    }
+
+    /// Seconds and hertz under `(x, y)`, clamped to the plot.
+    pub fn to_data(&self, x: f32, y: f32) -> (f64, f64) {
+        let p = self.plot;
+        let u = ((x - p.x as f32) / p.w.max(1) as f32).clamp(0.0, 1.0) as f64;
+        let v = (((p.y + p.h) as f32 - y) / p.h.max(1) as f32).clamp(0.0, 1.0) as f64;
+        (u * self.duration, self.scale.freq(v, self.nyquist).max(0.0))
+    }
+
+    /// Device pixel of seconds `t` and hertz `f`.
+    pub fn to_px(&self, t: f64, f: f64) -> (f32, f32) {
+        let p = self.plot;
+        let u = if self.duration > 0.0 { t / self.duration } else { 0.0 };
+        let v = self.scale.frac(f.max(1e-9), self.nyquist).clamp(0.0, 1.0);
+        (p.x as f32 + (u * p.w as f64) as f32, (p.y + p.h) as f32 - (v * p.h as f64) as f32)
+    }
+
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        self.plot.contains(x, y)
+    }
+}
+
+fn format_freq(f: f64) -> String {
+    if f < 1000.0 { format!("{f:.0} Hz") } else { format!("{:.2} kHz", f / 1000.0) }
 }
 
 fn background(y: usize, height: usize) -> [f32; 3] {
@@ -318,7 +370,13 @@ impl Renderer {
     pub fn overlay(&mut self, c: &mut Canvas, v: &View) {
         let l = layout(c.width(), c.height(), v.scale);
         let spec = v.spectrogram.filter(|s| s.columns() > 0 && s.bands() > 1);
-        if let (Some(s), Some(cur), true) = (spec, v.cursor, l.plot.w > 0 && l.plot.h > 0) {
+        if l.plot.w <= 0 || l.plot.h <= 0 {
+            return;
+        }
+        if let Some(sel) = v.selection.filter(|_| v.duration > 0.0 && v.sample_rate > 0) {
+            self.selection(c, &l, v, sel);
+        }
+        if let (Some(s), Some(cur)) = (spec, v.cursor) {
             self.crosshair(c, &l, s, v, cur);
         }
     }
@@ -696,6 +754,54 @@ impl Renderer {
         }
     }
 
+    fn selection(&mut self, c: &mut Canvas, l: &Layout, v: &View, sel: Selection) {
+        let p = l.plot;
+        let axes = Axes { plot: p, duration: v.duration, nyquist: v.sample_rate as f64 / 2.0, scale: v.freq_scale };
+        let (xa, ya) = axes.to_px(sel.t0.min(sel.t1), sel.f0.max(sel.f1));
+        let (xb, yb) = axes.to_px(sel.t0.max(sel.t1), sel.f0.min(sel.f1));
+        let (x0, y0, x1, y1) = (xa as i64, ya as i64, (xb as i64).max(xa as i64 + 1), (yb as i64).max(ya as i64 + 1));
+        // Spotlight: dim everything around the box.
+        let dim = 0.55;
+        c.fill(p.x, p.y, p.w, y0 - p.y, 0x000000, dim);
+        c.fill(p.x, y1, p.w, p.y + p.h - y1, 0x000000, dim);
+        c.fill(p.x, y0, x0 - p.x, y1 - y0, 0x000000, dim);
+        c.fill(x1, y0, p.x + p.w - x1, y1 - y0, 0x000000, dim);
+        let accent = quantize(self.lut.sample(0.93), 0, 0);
+        let box_rr = RoundRect { x: x0 as f32, y: y0 as f32, w: (x1 - x0) as f32, h: (y1 - y0) as f32, r: 4.0 * l.s };
+        c.stroke_round(box_rr, 1.5 * l.s, accent, 0.95);
+
+        if let Some(pos) = sel.playhead {
+            let (px, _) = axes.to_px(sel.t0.min(sel.t1) + pos, 0.0);
+            let w = (1.5 * l.s).max(1.0) as i64;
+            c.fill(px as i64, y0, w, y1 - y0, accent, 0.9);
+            c.fill(px as i64, l.envelope.y, w, l.envelope.h, accent, 0.8);
+        }
+
+        let (t0, t1) = (sel.t0.min(sel.t1), sel.t0.max(sel.t1));
+        let (f0, f1) = (sel.f0.min(sel.f1), sel.f0.max(sel.f1));
+        let mut text = format!(
+            "{} \u{2013} {}   {} \u{2013} {}",
+            format_time(t0, true),
+            format_time(t1, true),
+            format_freq(f0),
+            format_freq(f1)
+        );
+        if sel.playhead.is_some() {
+            text.push_str("   Looping");
+        }
+        let px = l.label_px * 1.05;
+        let tw = self.text.width(Weight::Semibold, px, &text);
+        let lh = self.text.line_height(Weight::Semibold, px);
+        let (pad, h) = (9.0 * l.s, lh + 10.0 * l.s);
+        let w = tw + 2.0 * pad;
+        let bx = (x0 as f32).clamp(p.x as f32, ((p.x + p.w) as f32 - w).max(p.x as f32));
+        let above = y0 as f32 - h - 6.0 * l.s;
+        let by = if above >= p.y as f32 { above } else { y0 as f32 + 6.0 * l.s };
+        let rr = RoundRect { x: bx, y: by, w, h, r: h / 2.0 };
+        c.fill_round(rr, accent, 0.95);
+        self.text.draw(c, Weight::Semibold, px, (bx + pad, by + (h - lh) / 2.0), 0x101014, &text);
+    }
+
     fn crosshair(&mut self, c: &mut Canvas, l: &Layout, s: &Spectrogram, v: &View, (cx, cy): (f32, f32)) {
         let p = l.plot;
         if !p.contains(cx, cy) {
@@ -719,7 +825,7 @@ impl Renderer {
         let f = if v.sample_rate > 0 { v.freq_scale.freq(fy as f64, nyquist) } else { 0.0 };
         if v.sample_rate > 0 {
             let f = f as f32;
-            parts.push(if f < 1000.0 { format!("{f:.0} Hz") } else { format!("{:.2} kHz", f / 1000.0) });
+            parts.push(format_freq(f as f64));
         }
         if ci < s.filled() {
             let at = if v.sample_rate > 0 { f / nyquist } else { fy as f64 };
@@ -832,6 +938,18 @@ mod tests {
         }
         // Mel gives music room: 0-4 kHz takes over half the height.
         assert!(FreqScale::Mel.frac(4000.0, 22050.0) > 0.5);
+    }
+
+    #[test]
+    fn axes_round_trip() {
+        for scale in FreqScale::ALL {
+            let a = Axes::new(1200, 700, 1.0, 30.0, 44100, scale);
+            let (x, y) = a.to_px(12.5, 3000.0);
+            assert!(a.contains(x, y));
+            let (t, f) = a.to_data(x, y);
+            assert!((t - 12.5).abs() < 0.05, "{scale:?} {t}");
+            assert!((f - 3000.0).abs() < 60.0, "{scale:?} {f}");
+        }
     }
 
     #[test]

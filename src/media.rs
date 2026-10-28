@@ -39,13 +39,13 @@ impl Stream {
     }
 }
 
-fn input_arg(path: &Path) -> OsString {
+pub(crate) fn input_arg(path: &Path) -> OsString {
     let mut arg = OsString::from("file:");
     arg.push(path.as_os_str());
     arg
 }
 
-fn tool(name: &str) -> OsString {
+pub(crate) fn tool(name: &str) -> OsString {
     let var = format!("SPECTRO_{}", name.to_ascii_uppercase());
     std::env::var_os(var).unwrap_or_else(|| OsString::from(name))
 }

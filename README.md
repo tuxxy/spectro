@@ -25,6 +25,11 @@ spectrograms around.
   as pills. A loudness waveform runs above the spectrogram, and a
   scanline sweeps across while it is analysed. Hover to get a crosshair
   that reads out time, frequency and level.
+- **Listen to a region.** Drag a box over any part of the spectrogram to
+  hear just that: the time span loops, and an FFT filter silences every
+  frequency outside the box. The rest of the picture dims and a playhead
+  runs through the box. Space stops or restarts the loop; a click or Esc
+  clears it.
 - **Better pictures.**
   - The frequency axis is linear to the Nyquist frequency (22.05 kHz for
     44.1 kHz audio), which is right for checking encoder cutoffs. The top
@@ -55,8 +60,8 @@ spectrograms around.
 
 ## Install
 
-You need a Rust toolchain (1.85 or newer) and FFmpeg (`ffmpeg` and
-`ffprobe` on your `PATH`).
+You need a Rust toolchain (1.85 or newer) and FFmpeg (`ffmpeg`, `ffprobe`
+and, for listening to regions, `ffplay` on your `PATH`).
 
 ```bash
 cargo install --git https://github.com/tuxxy/spectro
@@ -88,6 +93,9 @@ On macOS use Cmd instead of Ctrl.
 
 | Key | Action |
 | --- | --- |
+| Drag | Select a region and loop it, filtered to its frequency band |
+| Click | Clear the selection |
+| `Space` | Stop or restart the loop |
 | `Ctrl-O` | Open a file |
 | `Ctrl-S` | Save the picture as PNG |
 | `Ctrl-E` | Show the settings |
@@ -102,7 +110,7 @@ On macOS use Cmd instead of Ctrl.
 | `l`, `L` | Change the lower limit of the dynamic range in dBFS |
 | `y`, `Y` | Change the frequency scale (linear, mel, logarithmic) |
 | `g` | Turn the glow on or off |
-| `Esc` | Close a panel |
+| `Esc` | Close a panel, or clear the selection |
 
 Palette, window function, window size, range, frequency scale and glow
 are saved in
@@ -117,7 +125,7 @@ Windows).
   network.
 - The picture is redesigned (see above). For Spek's colours, use
   `-p spectrum --glow off`, or press `p` and `g`.
-- Extra: the hover readout, the loudness waveform, the frequency scales,
+- Extra: listening to a selected region, the hover readout, the loudness waveform, the frequency scales,
   the glow, three new palettes, and `--output` with the other command-line
   options.
 
@@ -126,7 +134,7 @@ Windows).
 | Path | What |
 | --- | --- |
 | `crates/spectro-core` | The `no_std` engine: `math`, `fft`, `analysis`, `palette`, `font`, `canvas`, `render`, `png` |
-| `src` | The program: FFmpeg input, background analysis, window, dialogs, settings, command line |
+| `src` | The program: FFmpeg input, background analysis, region playback (`ffplay`), window, dialogs, settings, command line |
 | `tools/fontgen.py` | Extracts glyph outlines from a TrueType font into `crates/spectro-core/assets` |
 
 ## Licence

@@ -6,21 +6,25 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use spectro_core::canvas::Canvas;
-use spectro_core::render::{Renderer, plot_rect};
+use spectro_core::render::{Axes, Renderer, Selection, plot_rect};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::media::{self, Stream};
 use crate::pipeline::{Job, Request};
+use crate::player::{Player, Region};
 use crate::settings::Settings;
 use crate::{VERSION, dialogs};
 
 /// How long the size must stay still before the analysis is redone.
 const RESIZE_SETTLE: Duration = Duration::from_millis(160);
+
+/// Frame interval for the playhead while a selection plays.
+const PLAYHEAD_FRAME: Duration = Duration::from_millis(33);
 
 pub enum UserEvent {
     Progress,
@@ -60,6 +64,10 @@ struct App {
     /// The last full picture, reused while only the pointer moves.
     base: Option<Canvas>,
     base_dirty: bool,
+    /// Where a selection drag started, in device pixels.
+    drag: Option<(f32, f32)>,
+    selection: Option<Region>,
+    player: Option<Player>,
 }
 
 pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: usize) -> Result<(), String> {
@@ -81,6 +89,9 @@ pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: us
         cursor: None,
         base: None,
         base_dirty: true,
+        drag: None,
+        selection: None,
+        player: None,
     };
     if let Some(f) = file {
         app.load(f, stream, channel);
@@ -108,9 +119,80 @@ impl App {
             self.channel = self.channel.min(ch - 1);
         }
         self.status = None;
+        self.clear_selection();
         self.restart();
         if let Some(g) = &self.gfx {
             g.window.set_title(&self.title());
+        }
+    }
+
+    fn axes(&self) -> Option<Axes> {
+        let g = self.gfx.as_ref()?;
+        let s = self.current().filter(|s| s.problem().is_none())?;
+        let size = g.window.inner_size();
+        let scale = g.window.scale_factor() as f32;
+        Some(Axes::new(
+            size.width as usize,
+            size.height as usize,
+            scale,
+            s.duration,
+            s.sample_rate,
+            self.settings.freq_scale,
+        ))
+    }
+
+    /// The region between the drag start and the pointer.
+    fn dragged_region(&self) -> Option<Region> {
+        let (start, end, axes) = (self.drag?, self.cursor?, self.axes()?);
+        let (t0, f0) = axes.to_data(start.0, start.1);
+        let (t1, f1) = axes.to_data(end.0, end.1);
+        Some(Region { t0: t0.min(t1), t1: t0.max(t1), f0: f0.min(f1), f1: f0.max(f1) })
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.player = None;
+        self.drag = None;
+    }
+
+    fn play(&mut self) {
+        self.player = None;
+        let (Some(path), Some(region), Some(s)) = (self.path.clone(), self.selection, self.current()) else { return };
+        let nyquist = s.sample_rate as f64 / 2.0;
+        match Player::start(&path, self.stream, region, nyquist) {
+            Ok(p) => self.player = Some(p),
+            Err(e) => self.status = Some(e),
+        }
+        self.redraw_later();
+    }
+
+    /// Left button: drag a box to select and loop it; click to clear.
+    fn mouse(&mut self, state: ElementState) {
+        if self.panel != Panel::None {
+            return;
+        }
+        match state {
+            ElementState::Pressed => {
+                let Some(cur) = self.cursor else { return };
+                if self.axes().is_some_and(|a| a.contains(cur.0, cur.1)) {
+                    self.drag = Some(cur);
+                    self.redraw_cursor();
+                }
+            }
+            ElementState::Released => {
+                let Some(start) = self.drag else { return };
+                let region = self.dragged_region();
+                self.drag = None;
+                let end = self.cursor.unwrap_or(start);
+                let min = 4.0 * self.gfx.as_ref().map_or(1.0, |g| g.window.scale_factor() as f32);
+                if (end.0 - start.0).abs() < min || (end.1 - start.1).abs() < min {
+                    self.clear_selection();
+                } else {
+                    self.selection = region;
+                    self.play();
+                }
+                self.redraw_cursor();
+            }
         }
     }
 
@@ -211,7 +293,10 @@ impl App {
                     row("l  L", "Raise / lower the lower limit"),
                     row("y  Y", "Next / previous frequency scale"),
                     row("g", "Glow on loud components"),
-                    row("Esc", "Close this panel"),
+                    row("Drag", "Select a region and loop it, filtered to its band"),
+                    row("Space", "Stop / restart the loop"),
+                    row("Click", "Clear the selection"),
+                    row("Esc", "Close this panel, or clear the selection"),
                 ],
             )),
             Panel::About => Some((
@@ -255,7 +340,15 @@ impl App {
         let mut v = crate::view(&title, &desc, self.current(), spec, &self.settings, scale);
         v.message = message.as_deref();
         v.panel = panel.as_ref().map(|(t, r)| (*t, r.as_slice()));
-        v.cursor = if self.panel == Panel::None { self.cursor } else { None };
+        v.cursor = if self.panel == Panel::None && self.drag.is_none() { self.cursor } else { None };
+        let region = self.dragged_region().or(self.selection);
+        v.selection = region.map(|r| Selection {
+            t0: r.t0,
+            t1: r.t1,
+            f0: r.f0,
+            f1: r.f1,
+            playhead: self.player.as_ref().filter(|_| self.drag.is_none()).map(Player::position),
+        });
         if base_only {
             self.renderer.render_base(canvas, &v);
         } else {
@@ -299,6 +392,7 @@ impl App {
         let mut canvas = Canvas::new(size.width.max(1) as usize, size.height.max(1) as usize, 0);
         let status = self.status.take();
         let cursor = self.cursor.take();
+        // The base picture leaves out the crosshair and the selection.
         self.paint(&mut canvas, scale, true);
         self.panel = panel;
         self.cursor = cursor;
@@ -315,7 +409,21 @@ impl App {
             Key::Named(NamedKey::F1) => {
                 self.panel = if self.mods.shift_key() { Panel::About } else { Panel::Help };
             }
-            Key::Named(NamedKey::Escape) => self.panel = Panel::None,
+            Key::Named(NamedKey::Escape) => {
+                if self.panel != Panel::None {
+                    self.panel = Panel::None;
+                } else {
+                    self.clear_selection();
+                    self.status = None;
+                }
+            }
+            Key::Named(NamedKey::Space) if self.selection.is_some() => {
+                if self.player.is_some() {
+                    self.player = None;
+                } else {
+                    self.play();
+                }
+            }
             Key::Character(s) if command => match s.to_lowercase().as_str() {
                 "o" => {
                     let proxy = self.proxy.clone();
@@ -352,6 +460,7 @@ impl App {
                         self.restart();
                     }
                     's' | 'S' if streams > 0 => {
+                        self.clear_selection();
                         self.stream = step(self.stream, streams, c == 's');
                         let ch = self.current().map_or(1, |s| s.channels.max(1) as usize);
                         self.channel = self.channel.min(ch - 1);
@@ -438,6 +547,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cursor = Some((position.x as f32, position.y as f32));
                 self.redraw_cursor();
             }
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => self.mouse(state),
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = None;
                 self.redraw_cursor();
@@ -450,13 +560,24 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match self.restart_at {
-            Some(t) if Instant::now() >= t => {
-                self.restart();
-                event_loop.set_control_flow(ControlFlow::Wait);
-            }
-            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+        let now = Instant::now();
+        let mut wake = self.restart_at;
+        if self.restart_at.is_some_and(|t| now >= t) {
+            self.restart();
+            wake = None;
         }
+        if let Some(running) = self.player.as_mut().map(Player::running) {
+            if running {
+                // Animate the playhead.
+                self.redraw_cursor();
+                let next = now + PLAYHEAD_FRAME;
+                wake = Some(wake.map_or(next, |w| w.min(next)));
+            } else {
+                self.player = None;
+                self.status = Some("Playback stopped: ffplay could not play this region".into());
+                self.redraw_later();
+            }
+        }
+        event_loop.set_control_flow(wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 }

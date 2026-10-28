@@ -9,6 +9,7 @@ mod dialogs;
 mod gui;
 mod media;
 mod pipeline;
+mod player;
 mod settings;
 
 use std::path::{Path, PathBuf};
@@ -51,9 +52,12 @@ Keys: Ctrl-O open, Ctrl-S save, Ctrl-E settings, F1 help (Cmd on macOS).
   c/C channel  s/S stream  p/P palette  f/F window function
   w/W window size  u/U upper limit  l/L lower limit
   y/Y frequency scale  g glow
+Mouse: drag a box to loop that region, filtered to its band; Space stops
+or restarts it; a click or Esc clears it.
 
 Settings are kept in ~/.config/spectro/preferences. FFmpeg (ffmpeg and
-ffprobe on the PATH, or SPECTRO_FFMPEG / SPECTRO_FFPROBE) decodes the audio.
+ffprobe on the PATH, or SPECTRO_FFMPEG / SPECTRO_FFPROBE) decodes the audio;
+ffplay (or SPECTRO_FFPLAY) plays selected regions.
 ";
 
 struct Args {
@@ -160,6 +164,7 @@ pub fn view<'a>(
         glow: settings.glow,
         freq_scale: settings.freq_scale,
         cursor: None,
+        selection: None,
     }
 }
 
