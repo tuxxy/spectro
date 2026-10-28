@@ -175,6 +175,9 @@ impl App {
     /// The seconds in the plot: the view, or in submarine mode while the
     /// analysis runs, the view scrolled to its front.
     fn shown_time(&self) -> (f64, f64) {
+        if !self.settings.sonar {
+            return self.time_range();
+        }
         let progress = self.job.as_ref().and_then(|j| {
             let sh = j.shared.lock().ok()?;
             Some(((j.request.t0, j.request.t1), sh.spectrogram.filled(), sh.spectrogram.columns()))
@@ -559,6 +562,8 @@ impl App {
         let desc = if self.path.is_some() { self.description() } else { String::new() };
         let message = self.message();
         let panel = self.panel_content();
+        // Before the lock below: the dragged region reads the analysis too.
+        let region = self.dragged_region().or(self.selection);
         let job = self.job.as_ref().map(|j| j.shared.clone());
         let guard = job.as_ref().and_then(|j| j.lock().ok());
         let spec = guard.as_ref().map(|g| &g.spectrogram);
@@ -572,7 +577,6 @@ impl App {
         v.message = message.as_deref();
         v.panel = panel.as_ref().map(|(title, sections)| RenderPanel { title, sections, footer: "Esc to close" });
         v.cursor = if self.panel == Panel::None && self.drag.is_none() { self.cursor } else { None };
-        let region = self.dragged_region().or(self.selection);
         v.selection = region.map(|r| Selection {
             t0: r.t0,
             t1: r.t1,
