@@ -25,11 +25,20 @@ pub enum Palette {
     Glacier,
     /// Black, indigo, sea green, lime, cream.
     Aurora,
+    /// Green phosphor, like a sonar display.
+    Sonar,
 }
 
 impl Palette {
-    pub const ALL: [Palette; 6] =
-        [Palette::Ember, Palette::Spectrum, Palette::Sox, Palette::Mono, Palette::Glacier, Palette::Aurora];
+    pub const ALL: [Palette; 7] = [
+        Palette::Ember,
+        Palette::Spectrum,
+        Palette::Sox,
+        Palette::Mono,
+        Palette::Glacier,
+        Palette::Aurora,
+        Palette::Sonar,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -39,6 +48,7 @@ impl Palette {
             Palette::Mono => "Mono",
             Palette::Glacier => "Glacier",
             Palette::Aurora => "Aurora",
+            Palette::Sonar => "Sonar",
         }
     }
 
@@ -50,6 +60,7 @@ impl Palette {
             Palette::Mono => "mono",
             Palette::Glacier => "glacier",
             Palette::Aurora => "aurora",
+            Palette::Sonar => "sonar",
         }
     }
 
@@ -75,6 +86,9 @@ impl Palette {
             }
             Palette::Aurora => {
                 &[0x000000, 0x0f0c2c, 0x2a1b63, 0x2d4590, 0x20799a, 0x1fa58b, 0x62c660, 0xc6e05a, 0xfff5c8]
+            }
+            Palette::Sonar => {
+                &[0x000000, 0x021208, 0x05290f, 0x0a4a1b, 0x147a2c, 0x26ad3f, 0x4fd85c, 0x9cf590, 0xeaffe0]
             }
             _ => return None,
         })
@@ -280,7 +294,7 @@ mod tests {
 
     #[test]
     fn designed_palettes_are_monotonic_in_lightness() {
-        for p in [Palette::Ember, Palette::Glacier, Palette::Aurora, Palette::Mono] {
+        for p in [Palette::Ember, Palette::Glacier, Palette::Aurora, Palette::Sonar, Palette::Mono] {
             let lut = Lut::new(p);
             let mut prev = -1.0;
             for i in 0..=200 {
