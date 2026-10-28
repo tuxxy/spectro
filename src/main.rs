@@ -42,12 +42,15 @@ Options:
   -w, --window-size N         DFT size, a power of two from 256 to 16384
   -u, --upper DB              upper limit of the dynamic range in dBFS
   -l, --lower DB              lower limit of the dynamic range in dBFS
+      --glow on|off           let loud components bloom (default on)
+      --freq-scale NAME       mel (default), linear or log
   -h, --help                  show this help and exit
   -V, --version               show the version and exit
 
 Keys: Ctrl-O open, Ctrl-S save, Ctrl-E settings, F1 help (Cmd on macOS).
   c/C channel  s/S stream  p/P palette  f/F window function
   w/W window size  u/U upper limit  l/L lower limit
+  y/Y frequency scale  g glow
 
 Settings are kept in ~/.config/spectro/preferences. FFmpeg (ffmpeg and
 ffprobe on the PATH, or SPECTRO_FFMPEG / SPECTRO_FFPROBE) decodes the audio.
@@ -124,6 +127,8 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-w" | "--window-size" => args.settings.push(("window_size", value()?)),
             "-u" | "--upper" => args.settings.push(("upper_db", value()?)),
             "-l" | "--lower" => args.settings.push(("lower_db", value()?)),
+            "--glow" => args.settings.push(("glow", value()?)),
+            "--freq-scale" => args.settings.push(("freq_scale", value()?)),
             _ => return Err(format!("unknown option {name}")),
         }
     }
@@ -152,6 +157,9 @@ pub fn view<'a>(
         message: None,
         panel: None,
         version: VERSION,
+        glow: settings.glow,
+        freq_scale: settings.freq_scale,
+        cursor: None,
     }
 }
 
@@ -177,7 +185,7 @@ fn render_to_file(args: &Args, settings: &Settings, output: &Path) -> Result<(),
         columns: plot.w as usize,
     };
     let mut spec = Spectrogram::new(req.columns, bands(req.fft_bits));
-    pipeline::run(&req, &AtomicBool::new(false), &mut |c, v| spec.set_column(c, v))?;
+    pipeline::run(&req, &AtomicBool::new(false), &mut |c| spec.set(c))?;
     let title = file.display().to_string();
     let desc = media::describe(&streams, args.stream, args.channel, 1 << settings.fft_bits, settings.window.name());
     let v = view(&title, &desc, Some(s), Some(&spec), settings, args.scale);

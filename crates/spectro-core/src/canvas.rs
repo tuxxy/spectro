@@ -4,6 +4,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+#[derive(Clone)]
 pub struct Canvas {
     width: usize,
     height: usize,
@@ -85,5 +86,93 @@ impl Canvas {
         self.fill(x - t, y + h, w + 2 * t, t, color, 1.0);
         self.fill(x - t, y, t, h, color, 1.0);
         self.fill(x + w, y, t, h, color, 1.0);
+    }
+}
+
+/// Signed distance from `(px, py)` to a rounded rectangle (negative inside).
+fn rounded_distance(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) -> f32 {
+    let (hw, hh) = (w * 0.5, h * 0.5);
+    let r = r.min(hw).min(hh).max(0.0);
+    let qx = (px - (x + hw)).abs() - (hw - r);
+    let qy = (py - (y + hh)).abs() - (hh - r);
+    let (ox, oy) = (qx.max(0.0), qy.max(0.0));
+    crate::math::sqrt((ox * ox + oy * oy) as f64) as f32 + qx.max(qy).min(0.0) - r
+}
+
+/// A rounded rectangle in device pixels, possibly fractional.
+#[derive(Clone, Copy, Debug)]
+pub struct RoundRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub r: f32,
+}
+
+impl RoundRect {
+    fn distance(&self, px: f32, py: f32) -> f32 {
+        rounded_distance(px, py, self.x, self.y, self.w, self.h, self.r)
+    }
+
+    fn bounds(&self, pad: f32, c: &Canvas) -> (usize, usize, usize, usize) {
+        let x0 = crate::math::floorf(self.x - pad).max(0.0) as usize;
+        let y0 = crate::math::floorf(self.y - pad).max(0.0) as usize;
+        let x1 = (crate::math::ceilf(self.x + self.w + pad).max(0.0) as usize).min(c.width);
+        let y1 = (crate::math::ceilf(self.y + self.h + pad).max(0.0) as usize).min(c.height);
+        (x0, y0, x1, y1)
+    }
+}
+
+impl Canvas {
+    /// Fills a rounded rectangle with anti-aliased edges.
+    pub fn fill_round(&mut self, rr: RoundRect, color: u32, alpha: f32) {
+        let (x0, y0, x1, y1) = rr.bounds(1.0, self);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let cov = (0.5 - rr.distance(x as f32 + 0.5, y as f32 + 0.5)).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let p = &mut self.pixels[y * self.width + x];
+                    *p = mix(*p, color, cov * alpha);
+                }
+            }
+        }
+    }
+
+    /// Strokes the inside edge of a rounded rectangle, `t` pixels wide.
+    pub fn stroke_round(&mut self, rr: RoundRect, t: f32, color: u32, alpha: f32) {
+        let (x0, y0, x1, y1) = rr.bounds(1.0, self);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let d = rr.distance(x as f32 + 0.5, y as f32 + 0.5);
+                let cov = (t * 0.5 + 0.5 - (d + t * 0.5).abs()).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let p = &mut self.pixels[y * self.width + x];
+                    *p = mix(*p, color, cov * alpha);
+                }
+            }
+        }
+    }
+
+    /// Replaces everything outside the rounded corners of `rr` (within its
+    /// bounding box) with `outside(y)`, anti-aliased.
+    pub fn clip_round(&mut self, rr: RoundRect, outside: impl Fn(usize, usize) -> u32) {
+        let (x0, y0, x1, y1) = rr.bounds(0.0, self);
+        let r = crate::math::ceilf(rr.r) as usize + 1;
+        for y in y0..y1 {
+            let near_y = y < y0 + r || y + r >= y1;
+            if !near_y {
+                continue;
+            }
+            for x in x0..x1 {
+                if x >= x0 + r && x + r < x1 {
+                    continue;
+                }
+                let inside = (0.5 - rr.distance(x as f32 + 0.5, y as f32 + 0.5)).clamp(0.0, 1.0);
+                if inside < 1.0 {
+                    let p = &mut self.pixels[y * self.width + x];
+                    *p = mix(outside(x, y), *p, inside);
+                }
+            }
+        }
     }
 }

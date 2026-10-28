@@ -56,6 +56,10 @@ struct App {
     panel: Panel,
     mods: ModifiersState,
     status: Option<String>,
+    cursor: Option<(f32, f32)>,
+    /// The last full picture, reused while only the pointer moves.
+    base: Option<Canvas>,
+    base_dirty: bool,
 }
 
 pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: usize) -> Result<(), String> {
@@ -74,6 +78,9 @@ pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: us
         panel: Panel::None,
         mods: ModifiersState::empty(),
         status: None,
+        cursor: None,
+        base: None,
+        base_dirty: true,
     };
     if let Some(f) = file {
         app.load(f, stream, channel);
@@ -150,7 +157,13 @@ impl App {
         self.redraw_later();
     }
 
-    fn redraw_later(&self) {
+    fn redraw_later(&mut self) {
+        self.base_dirty = true;
+        self.redraw_cursor();
+    }
+
+    /// Redraws without rebuilding the cached picture.
+    fn redraw_cursor(&self) {
         if let Some(g) = &self.gfx {
             g.window.request_redraw();
         }
@@ -168,7 +181,7 @@ impl App {
 
     fn message(&self) -> Option<String> {
         if self.path.is_none() {
-            return Some(format!("Drop an audio file here, or press {}-O to open one", command_key()));
+            return Some(format!("Drop an audio file here\nor press {}-O to open one", command_key()));
         }
         if let Some(s) = &self.status {
             return Some(s.clone());
@@ -196,6 +209,8 @@ impl App {
                     row("w  W", "Larger / smaller window"),
                     row("u  U", "Raise / lower the upper limit"),
                     row("l  L", "Raise / lower the lower limit"),
+                    row("y  Y", "Next / previous frequency scale"),
+                    row("g", "Glow on loud components"),
                     row("Esc", "Close this panel"),
                 ],
             )),
@@ -220,6 +235,8 @@ impl App {
                         row("w  W", &format!("Window size: {}", 1u32 << s.fft_bits)),
                         row("u  U", &format!("Upper limit: {} dBFS", s.upper_db)),
                         row("l  L", &format!("Lower limit: {} dBFS", s.lower_db)),
+                        row("y  Y", &format!("Frequency scale: {}", s.freq_scale.name())),
+                        row("g", &format!("Glow: {}", if s.glow { "on" } else { "off" })),
                         row("", "Saved automatically"),
                     ],
                 ))
@@ -227,7 +244,7 @@ impl App {
         }
     }
 
-    fn paint(&mut self, canvas: &mut Canvas, scale: f32) {
+    fn paint(&mut self, canvas: &mut Canvas, scale: f32, base_only: bool) {
         let title = self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
         let desc = if self.path.is_some() { self.description() } else { String::new() };
         let message = self.message();
@@ -238,7 +255,12 @@ impl App {
         let mut v = crate::view(&title, &desc, self.current(), spec, &self.settings, scale);
         v.message = message.as_deref();
         v.panel = panel.as_ref().map(|(t, r)| (*t, r.as_slice()));
-        self.renderer.render(canvas, &v);
+        v.cursor = if self.panel == Panel::None { self.cursor } else { None };
+        if base_only {
+            self.renderer.render_base(canvas, &v);
+        } else {
+            self.renderer.overlay(canvas, &v);
+        }
     }
 
     fn redraw(&mut self) {
@@ -246,8 +268,17 @@ impl App {
         let size = g.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
         let scale = g.window.scale_factor() as f32;
-        let mut canvas = Canvas::new(size.width as usize, size.height as usize, 0);
-        self.paint(&mut canvas, scale);
+        let (w_px, h_px) = (size.width as usize, size.height as usize);
+        let stale = self.base.as_ref().is_none_or(|b| b.width() != w_px || b.height() != h_px);
+        if self.base_dirty || stale {
+            let mut base = self.base.take().filter(|b| b.width() == w_px && b.height() == h_px);
+            let base_canvas = base.get_or_insert_with(|| Canvas::new(w_px, h_px, 0));
+            self.paint(base_canvas, scale, true);
+            self.base = base;
+            self.base_dirty = false;
+        }
+        let Some(mut canvas) = self.base.clone() else { return };
+        self.paint(&mut canvas, scale, false);
         let Some(g) = &mut self.gfx else { return };
         if g.surface.resize(w, h).is_err() {
             return;
@@ -267,8 +298,10 @@ impl App {
         let panel = std::mem::replace(&mut self.panel, Panel::None);
         let mut canvas = Canvas::new(size.width.max(1) as usize, size.height.max(1) as usize, 0);
         let status = self.status.take();
-        self.paint(&mut canvas, scale);
+        let cursor = self.cursor.take();
+        self.paint(&mut canvas, scale, true);
         self.panel = panel;
+        self.cursor = cursor;
         let png = spectro_core::png::encode(canvas.width(), canvas.height(), canvas.pixels());
         self.status = match std::fs::write(path, png) {
             Ok(()) => status,
@@ -401,6 +434,14 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw_later();
             }
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some((position.x as f32, position.y as f32));
+                self.redraw_cursor();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                self.redraw_cursor();
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 self.key(event_loop, event.logical_key);
             }

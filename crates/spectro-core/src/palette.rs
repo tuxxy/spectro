@@ -131,11 +131,16 @@ impl Lut {
 
     /// Dithered `0x00RRGGBB` colour for `level` at pixel `(x, y)`.
     pub fn color(&self, level: f32, x: usize, y: usize) -> u32 {
-        let d = (BAYER[(y & 7) * 8 + (x & 7)] as f32 + 0.5) / 64.0;
-        let [r, g, b] = self.sample(level);
-        let q = |v: f32| (v + d).clamp(0.0, 255.0) as u32;
-        (q(r) << 16) | (q(g) << 8) | q(b)
+        quantize(self.sample(level), x, y)
     }
+}
+
+/// Rounds an sRGB colour in `0..=255` to 8 bits with ordered dithering, so
+/// smooth gradients keep no visible steps.
+pub fn quantize([r, g, b]: [f32; 3], x: usize, y: usize) -> u32 {
+    let d = (BAYER[(y & 7) * 8 + (x & 7)] as f32 + 0.5) / 64.0;
+    let q = |v: f32| (v + d).clamp(0.0, 255.0) as u32;
+    (q(r) << 16) | (q(g) << 8) | q(b)
 }
 
 // Modified version of Dan Bruton's algorithm, as in Spek.

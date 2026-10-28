@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use spectro_core::analysis::{Analyzer, Spectrogram, WindowFunction, bands};
+use spectro_core::analysis::{Analyzer, Column, Spectrogram, WindowFunction, bands};
 
 use crate::media::Decoder;
 
@@ -23,7 +23,7 @@ pub struct Request {
 
 /// Decodes and analyses `req`, calling `emit` for each finished column.
 /// Stops early, without error, once `cancel` is set.
-pub fn run(req: &Request, cancel: &AtomicBool, emit: &mut impl FnMut(usize, &[f32])) -> Result<(), String> {
+pub fn run(req: &Request, cancel: &AtomicBool, emit: &mut impl FnMut(&Column)) -> Result<(), String> {
     if req.columns == 0 {
         return Ok(());
     }
@@ -65,9 +65,9 @@ impl Job {
         let (c, s, r) = (cancel.clone(), shared.clone(), req.clone());
         std::thread::spawn(move || {
             let mut last = Instant::now();
-            let result = run(&r, &c, &mut |col, values| {
+            let result = run(&r, &c, &mut |col| {
                 if let Ok(mut sh) = s.lock() {
-                    sh.spectrogram.set_column(col, values);
+                    sh.spectrogram.set(col);
                 }
                 if last.elapsed() > Duration::from_millis(33) {
                     last = Instant::now();

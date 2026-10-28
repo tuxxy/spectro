@@ -194,25 +194,28 @@ pub fn describe(streams: &[Stream], stream: usize, channel: usize, fft: usize, w
     let Some(s) = streams.get(stream) else { return String::new() };
     let mut items = Vec::new();
     if !s.codec.is_empty() {
-        items.push(s.codec.clone());
+        // "FLAC (Free Lossless Audio Codec)" reads as "FLAC".
+        let short = s.codec.split(" (").next().unwrap_or(&s.codec);
+        items.push(short.to_string());
     }
     if s.bit_rate > 0 {
         items.push(format!("{} kbps", (s.bit_rate + 500) / 1000));
     }
     if s.sample_rate > 0 {
-        items.push(format!("{} Hz", s.sample_rate));
+        let khz = format!("{:.1}", s.sample_rate as f64 / 1000.0);
+        items.push(format!("{} kHz", khz.trim_end_matches(".0")));
     }
     if s.bits_per_sample > 0 && s.bit_rate == 0 {
-        let unit = if s.bits_per_sample == 1 { "bit" } else { "bits" };
-        items.push(format!("{} {unit}", s.bits_per_sample));
+        items.push(format!("{}-bit", s.bits_per_sample));
     }
-    if s.channels > 0 {
-        items.push(format!("channel {} / {}", channel + 1, s.channels));
+    match s.channels {
+        0 => {}
+        1 => items.push("Mono".into()),
+        n => items.push(format!("Channel {} of {n}", channel + 1)),
     }
-    items.push(format!("W:{fft}"));
-    items.push(format!("F:{window}"));
+    items.push(format!("{window} \u{b7} {fft}"));
     let desc = items.join(", ");
-    if streams.len() > 1 { format!("Stream {} / {}: {desc}", stream + 1, streams.len()) } else { desc }
+    if streams.len() > 1 { format!("Stream {} of {}: {desc}", stream + 1, streams.len()) } else { desc }
 }
 
 #[cfg(test)]
@@ -240,7 +243,7 @@ mod tests {
         assert_eq!(s[0].samples(), 551_250);
         assert_eq!(
             describe(&s, 0, 1, 2048, "Hann"),
-            "Stream 1 / 2: FLAC (Free Lossless Audio Codec), 44100 Hz, 16 bits, channel 2 / 2, W:2048, F:Hann"
+            "Stream 1 of 2: FLAC, 44.1 kHz, 16-bit, Channel 2 of 2, Hann \u{b7} 2048"
         );
         assert!(describe(&s, 1, 0, 2048, "Hann").contains("320 kbps"));
     }

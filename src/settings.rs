@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use spectro_core::analysis::{DEFAULT_FFT_BITS, MAX_FFT_BITS, MIN_FFT_BITS, WindowFunction};
 use spectro_core::palette::Palette;
-use spectro_core::render::{DEFAULT_LOWER_DB, DEFAULT_UPPER_DB, MAX_DB, MIN_DB};
+use spectro_core::render::{DEFAULT_LOWER_DB, DEFAULT_UPPER_DB, FreqScale, MAX_DB, MIN_DB};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
@@ -13,6 +13,8 @@ pub struct Settings {
     pub fft_bits: u32,
     pub upper_db: i32,
     pub lower_db: i32,
+    pub glow: bool,
+    pub freq_scale: FreqScale,
 }
 
 impl Default for Settings {
@@ -23,6 +25,8 @@ impl Default for Settings {
             fft_bits: DEFAULT_FFT_BITS,
             upper_db: DEFAULT_UPPER_DB,
             lower_db: DEFAULT_LOWER_DB,
+            glow: true,
+            freq_scale: FreqScale::default(),
         }
     }
 }
@@ -54,12 +58,14 @@ impl Settings {
     pub fn save(&self) {
         let Some(p) = path() else { return };
         let text = format!(
-            "# spectro preferences\npalette={}\nwindow_function={}\nwindow_size={}\nupper_db={}\nlower_db={}\n",
+            "# spectro preferences\npalette={}\nwindow_function={}\nwindow_size={}\nupper_db={}\nlower_db={}\nglow={}\nfreq_scale={}\n",
             self.palette.id(),
             self.window.id(),
             1u32 << self.fft_bits,
             self.upper_db,
-            self.lower_db
+            self.lower_db,
+            if self.glow { "on" } else { "off" },
+            self.freq_scale.id()
         );
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -83,6 +89,18 @@ impl Settings {
             },
             "upper_db" => value.parse().map(|v| self.upper_db = v).is_ok(),
             "lower_db" => value.parse().map(|v| self.lower_db = v).is_ok(),
+            "freq_scale" => FreqScale::from_id(&value.to_ascii_lowercase()).map(|f| self.freq_scale = f).is_some(),
+            "glow" => match value {
+                "on" | "true" | "1" => {
+                    self.glow = true;
+                    true
+                }
+                "off" | "false" | "0" => {
+                    self.glow = false;
+                    true
+                }
+                _ => false,
+            },
             _ => false,
         };
         self.clamp();
@@ -108,6 +126,9 @@ impl Settings {
             'U' => self.upper_db = (self.upper_db - 1).max(self.lower_db + 1),
             'w' => self.fft_bits = (self.fft_bits + 1).min(MAX_FFT_BITS),
             'W' => self.fft_bits = (self.fft_bits - 1).max(MIN_FFT_BITS),
+            'g' | 'G' => self.glow = !self.glow,
+            'y' => self.freq_scale = self.freq_scale.next(),
+            'Y' => self.freq_scale = self.freq_scale.prev(),
             _ => return false,
         }
         true

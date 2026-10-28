@@ -84,18 +84,42 @@ pub fn bands(bits: u32) -> usize {
     (1 << (bits - 1)) + 1
 }
 
-/// A spectrogram in dBFS, stored column by column (low frequency first).
+/// One finished column of the analysis.
+pub struct Column<'a> {
+    pub index: usize,
+    /// Level per band in dBFS, low frequency first.
+    pub db: &'a [f32],
+    /// Loudness of the column's time slice.
+    pub envelope: Envelope,
+}
+
+/// Peak and RMS amplitude (linear, full scale = 1) of a time slice.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Envelope {
+    pub peak: f32,
+    pub rms: f32,
+}
+
+/// A spectrogram in dBFS, stored column by column (low frequency first),
+/// with the loudness envelope of each column.
 #[derive(Clone)]
 pub struct Spectrogram {
     columns: usize,
     bands: usize,
     filled: usize,
     data: Vec<f32>,
+    envelope: Vec<Envelope>,
 }
 
 impl Spectrogram {
     pub fn new(columns: usize, bands: usize) -> Self {
-        Spectrogram { columns, bands, filled: 0, data: vec![FLOOR_DB; columns * bands] }
+        Spectrogram {
+            columns,
+            bands,
+            filled: 0,
+            data: vec![FLOOR_DB; columns * bands],
+            envelope: vec![Envelope::default(); columns],
+        }
     }
 
     pub fn columns(&self) -> usize {
@@ -115,10 +139,16 @@ impl Spectrogram {
         &self.data[c * self.bands..(c + 1) * self.bands]
     }
 
-    /// Stores column `c`. Columns past the end or of the wrong height are ignored.
-    pub fn set_column(&mut self, c: usize, values: &[f32]) {
-        if c < self.columns && values.len() == self.bands {
-            self.data[c * self.bands..(c + 1) * self.bands].copy_from_slice(values);
+    pub fn envelope(&self, c: usize) -> Envelope {
+        self.envelope[c]
+    }
+
+    /// Stores a column. Columns past the end or of the wrong height are ignored.
+    pub fn set(&mut self, col: &Column) {
+        let c = col.index;
+        if c < self.columns && col.db.len() == self.bands {
+            self.data[c * self.bands..(c + 1) * self.bands].copy_from_slice(col.db);
+            self.envelope[c] = col.envelope;
             self.filled = self.filled.max(c + 1);
         }
     }
@@ -195,8 +225,8 @@ impl Analyzer {
         start + ((2 * j + 1) as u128 * len as u128 / (2 * count) as u128) as u64
     }
 
-    /// Feeds samples; `emit(column, values_db)` is called for each finished column.
-    pub fn push(&mut self, samples: &[f32], emit: &mut impl FnMut(usize, &[f32])) {
+    /// Feeds samples; `emit` is called for each finished column.
+    pub fn push(&mut self, samples: &[f32], emit: &mut impl FnMut(&Column)) {
         let end = self.buf_start + self.buf.len() as u64;
         let room = self.total.saturating_sub(end) as usize;
         self.buf.extend_from_slice(&samples[..samples.len().min(room)]);
@@ -205,12 +235,12 @@ impl Analyzer {
 
     /// Signals the end of the stream and emits all remaining columns; any
     /// part of the expected duration that never arrived reads as silence.
-    pub fn finish(&mut self, emit: &mut impl FnMut(usize, &[f32])) {
+    pub fn finish(&mut self, emit: &mut impl FnMut(&Column)) {
         self.eof = true;
         self.drain(emit);
     }
 
-    fn drain(&mut self, emit: &mut impl FnMut(usize, &[f32])) {
+    fn drain(&mut self, emit: &mut impl FnMut(&Column)) {
         let n = self.fft.len() as u64;
         let have = self.buf_start + self.buf.len() as u64;
         while self.next < self.columns {
@@ -233,12 +263,13 @@ impl Analyzer {
                 let p = *a * scale;
                 *o = if p > 1e-20 { (10.0 * math::log10(p as f64)) as f32 } else { FLOOR_DB };
             }
-            emit(self.next, &self.out);
+            let envelope = self.envelope(start, start + len);
+            emit(&Column { index: self.next, db: &self.out, envelope });
             self.next += 1;
             // Keep only what the next column can still reach.
             if self.next < self.columns {
                 let (s, l, k) = self.centres(self.next);
-                let keep_from = Self::centre(s, l, k, 0).saturating_sub(n / 2);
+                let keep_from = Self::centre(s, l, k, 0).saturating_sub(n / 2).min(s);
                 if keep_from > self.buf_start {
                     let drop = ((keep_from - self.buf_start) as usize).min(self.buf.len());
                     self.buf.drain(..drop);
@@ -246,6 +277,22 @@ impl Analyzer {
                 }
             }
         }
+    }
+
+    /// Peak and RMS of the samples in `[start, end)` that are buffered.
+    fn envelope(&self, start: u64, end: u64) -> Envelope {
+        let from = start.saturating_sub(self.buf_start) as usize;
+        let to = (end.saturating_sub(self.buf_start) as usize).min(self.buf.len());
+        let slice = &self.buf[from.min(to)..to];
+        if slice.is_empty() {
+            return Envelope::default();
+        }
+        let (mut peak, mut sum) = (0.0f32, 0.0f64);
+        for &v in slice {
+            peak = peak.max(v.abs());
+            sum += (v * v) as f64;
+        }
+        Envelope { peak, rms: math::sqrt(sum / slice.len() as f64) as f32 }
     }
 
     fn transform(&mut self, centre: u64) {
@@ -273,9 +320,9 @@ mod tests {
         let mut a = Analyzer::new(bits, w, samples.len() as u64, cols);
         let mut s = Spectrogram::new(cols, a.bands());
         for part in samples.chunks(chunk) {
-            a.push(part, &mut |c, v| s.set_column(c, v));
+            a.push(part, &mut |c| s.set(c));
         }
-        a.finish(&mut |c, v| s.set_column(c, v));
+        a.finish(&mut |c| s.set(c));
         assert_eq!(s.filled(), cols);
         s
     }
@@ -292,6 +339,11 @@ mod tests {
                 let col = s.column(c);
                 assert!((col[bin] - 0.0).abs() < 0.05, "{w:?} col {c}: {}", col[bin]);
                 assert!(col[bin + 40] < -60.0);
+                let e = s.envelope(c);
+                assert!(
+                    (e.peak - 1.0).abs() < 0.01 && (e.rms - core::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+                    "{e:?}"
+                );
             }
         }
     }
@@ -303,6 +355,7 @@ mod tests {
         let b = run(&x, 9, WindowFunction::Hann, 33, 20000);
         for c in 0..33 {
             assert_eq!(a.column(c), b.column(c));
+            assert_eq!(a.envelope(c), b.envelope(c));
         }
     }
 
@@ -312,8 +365,8 @@ mod tests {
         let x = [0.5f32; 10];
         let mut a = Analyzer::new(8, WindowFunction::Hann, 100, 300);
         let mut n = 0;
-        a.push(&x, &mut |_, _| n += 1);
-        a.finish(&mut |_, _| n += 1);
+        a.push(&x, &mut |_| n += 1);
+        a.finish(&mut |_| n += 1);
         assert_eq!(n, 300);
     }
 }
