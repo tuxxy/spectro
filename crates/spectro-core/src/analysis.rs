@@ -143,6 +143,10 @@ impl Spectrogram {
         self.envelope[c]
     }
 
+    pub fn envelopes(&self) -> &[Envelope] {
+        &self.envelope
+    }
+
     /// Stores a column. Columns past the end or of the wrong height are ignored.
     pub fn set(&mut self, col: &Column) {
         let c = col.index;
@@ -159,7 +163,12 @@ pub struct Analyzer {
     fft: RealFft,
     window: Vec<f32>,
     norm: f32,
-    total: u64,
+    /// First sample of column 0, counted from the start of the stream.
+    lead: u64,
+    /// Samples covered by all the columns.
+    len: u64,
+    /// No samples past this index are kept.
+    limit: u64,
     columns: usize,
     next: usize,
     /// Absolute index of `buf[0]` in the stream.
@@ -175,6 +184,14 @@ pub struct Analyzer {
 impl Analyzer {
     /// `total` is the expected number of samples; `columns` the image width.
     pub fn new(bits: u32, window: WindowFunction, total: u64, columns: usize) -> Self {
+        Self::with_range(bits, window, 0, total, total, columns)
+    }
+
+    /// Analyses `len` samples starting `lead` samples into the stream, for a
+    /// zoomed view. The stream should start a window's length before the
+    /// range (`lead`) and run past it, so edge columns see real audio;
+    /// samples past `limit` are ignored.
+    pub fn with_range(bits: u32, window: WindowFunction, lead: u64, len: u64, limit: u64, columns: usize) -> Self {
         let bits = bits.clamp(MIN_FFT_BITS, MAX_FFT_BITS);
         let fft = RealFft::new(bits);
         let n = fft.len();
@@ -185,7 +202,9 @@ impl Analyzer {
             fft,
             norm: 4.0 / (sum * sum),
             window,
-            total,
+            lead,
+            len,
+            limit,
             columns,
             next: 0,
             buf_start: 0,
@@ -208,7 +227,7 @@ impl Analyzer {
     }
 
     fn interval(&self, c: usize) -> (u64, u64) {
-        let at = |c: usize| (self.total as u128 * c as u128 / self.columns as u128) as u64;
+        let at = |c: usize| self.lead + (self.len as u128 * c as u128 / self.columns as u128) as u64;
         (at(c), at(c + 1))
     }
 
@@ -228,7 +247,7 @@ impl Analyzer {
     /// Feeds samples; `emit` is called for each finished column.
     pub fn push(&mut self, samples: &[f32], emit: &mut impl FnMut(&Column)) {
         let end = self.buf_start + self.buf.len() as u64;
-        let room = self.total.saturating_sub(end) as usize;
+        let room = self.limit.saturating_sub(end) as usize;
         self.buf.extend_from_slice(&samples[..samples.len().min(room)]);
         self.drain(emit);
     }
@@ -246,7 +265,7 @@ impl Analyzer {
         while self.next < self.columns {
             let (start, len, count) = self.centres(self.next);
             let last = Self::centre(start, len, count, count - 1);
-            let need = (last + n / 2).min(self.total);
+            let need = (last + n / 2).min(self.limit);
             if !self.eof && have < need {
                 break;
             }
@@ -356,6 +375,27 @@ mod tests {
         for c in 0..33 {
             assert_eq!(a.column(c), b.column(c));
             assert_eq!(a.envelope(c), b.envelope(c));
+        }
+    }
+
+    #[test]
+    fn range_matches_full_analysis() {
+        // Analysing columns 10..20 of a 40-column picture from a stream that
+        // starts with a lead-in gives the same columns as the full run.
+        let x: std::vec::Vec<f32> = (0..40000).map(|i| ((i * 37) % 101) as f32 / 101.0 - 0.5).collect();
+        let full = run(&x, 9, WindowFunction::Hann, 40, 4096);
+        let (start, end) = (10000u64, 20000u64);
+        let lead = 512u64;
+        let from = (start - lead) as usize;
+        let mut a = Analyzer::with_range(9, WindowFunction::Hann, lead, end - start, lead + (end - start) + 512, 10);
+        let mut s = Spectrogram::new(10, a.bands());
+        a.push(&x[from..], &mut |c| s.set(c));
+        a.finish(&mut |c| s.set(c));
+        for c in 0..10 {
+            let (got, want) = (s.column(c), full.column(10 + c));
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 1e-3, "column {c}: {g} vs {w}");
+            }
         }
     }
 

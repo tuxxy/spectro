@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use spectro_core::analysis::Envelope;
 use spectro_core::canvas::Canvas;
-use spectro_core::render::{Axes, Panel as RenderPanel, Renderer, Section, Selection, plot_rect};
+use spectro_core::render::{Axes, Panel as RenderPanel, Renderer, Section, Selection, plot_rect, strip_rect};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -24,6 +25,10 @@ use crate::{VERSION, dialogs};
 
 /// How long the size must stay still before the analysis is redone.
 const RESIZE_SETTLE: Duration = Duration::from_millis(160);
+
+/// The narrowest views allowed, in seconds and hertz.
+const MIN_TIME_SPAN: f64 = 0.02;
+const MIN_FREQ_SPAN: f64 = 20.0;
 
 /// Frame interval for the playhead while a selection plays.
 const PLAYHEAD_FRAME: Duration = Duration::from_millis(33);
@@ -75,6 +80,11 @@ struct App {
     player: Option<Player>,
     menu: Option<MenuBar>,
     recent: Vec<PathBuf>,
+    /// Zoomed time and frequency ranges; `None` shows everything.
+    zoom_time: Option<(f64, f64)>,
+    zoom_freq: Option<(f64, f64)>,
+    /// Loudness of the whole file, kept from the last full analysis.
+    overview: Option<Vec<Envelope>>,
 }
 
 pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: usize) -> Result<(), String> {
@@ -101,6 +111,9 @@ pub fn run(file: Option<PathBuf>, settings: Settings, stream: usize, channel: us
         player: None,
         menu: None,
         recent: recent::load(),
+        zoom_time: None,
+        zoom_freq: None,
+        overview: None,
     };
     if let Some(f) = file {
         app.load(f, stream, channel);
@@ -133,6 +146,9 @@ impl App {
         }
         self.status = None;
         self.clear_selection();
+        self.zoom_time = None;
+        self.zoom_freq = None;
+        self.overview = None;
         self.restart();
         self.sync_menu();
         if let Some(g) = &self.gfx {
@@ -142,17 +158,98 @@ impl App {
 
     fn axes(&self) -> Option<Axes> {
         let g = self.gfx.as_ref()?;
-        let s = self.current().filter(|s| s.problem().is_none())?;
+        self.current().filter(|s| s.problem().is_none())?;
         let size = g.window.inner_size();
         let scale = g.window.scale_factor() as f32;
         Some(Axes::new(
             size.width as usize,
             size.height as usize,
             scale,
-            s.duration,
-            s.sample_rate,
+            self.time_range(),
+            self.freq_range(),
             self.settings.freq_scale,
         ))
+    }
+
+    fn duration(&self) -> f64 {
+        self.current().map_or(0.0, |s| s.duration)
+    }
+
+    fn nyquist(&self) -> f64 {
+        self.current().map_or(1.0, |s| s.sample_rate.max(2) as f64 / 2.0)
+    }
+
+    fn time_range(&self) -> (f64, f64) {
+        self.zoom_time.unwrap_or((0.0, self.duration()))
+    }
+
+    fn freq_range(&self) -> (f64, f64) {
+        self.zoom_freq.unwrap_or((0.0, self.nyquist()))
+    }
+
+    /// Shows `t0..t1` seconds, kept inside the file; re-analysis follows
+    /// once the view stops changing.
+    fn set_time_range(&mut self, t0: f64, t1: f64) {
+        let dur = self.duration();
+        if dur <= 0.0 {
+            return;
+        }
+        let span = (t1 - t0).clamp(MIN_TIME_SPAN.min(dur), dur);
+        let start = t0.clamp(0.0, dur - span);
+        self.zoom_time = if span >= dur - 1e-9 { None } else { Some((start, start + span)) };
+        if self.job.as_ref().is_none_or(|j| (j.request.t0, j.request.t1) != self.time_range()) {
+            self.restart_at = Some(Instant::now() + RESIZE_SETTLE);
+        }
+        self.redraw_later();
+    }
+
+    fn set_freq_range(&mut self, f0: f64, f1: f64) {
+        let ny = self.nyquist();
+        let span = (f1 - f0).clamp(MIN_FREQ_SPAN.min(ny), ny);
+        let start = f0.clamp(0.0, ny - span);
+        self.zoom_freq = if span >= ny - 1e-9 { None } else { Some((start, start + span)) };
+        self.redraw_later();
+    }
+
+    /// Scales the time span by `factor` (below 1 zooms in) around `anchor` seconds.
+    fn zoom_time_by(&mut self, factor: f64, anchor: f64) {
+        let (t0, t1) = self.time_range();
+        let span = (t1 - t0) * factor;
+        let k = if t1 > t0 { (anchor - t0) / (t1 - t0) } else { 0.5 };
+        self.set_time_range(anchor - k * span, anchor - k * span + span);
+    }
+
+    /// The time under the pointer, or the middle of the view.
+    fn anchor_time(&self) -> f64 {
+        let (t0, t1) = self.time_range();
+        match (self.cursor, self.axes()) {
+            (Some(c), Some(a)) if a.contains(c.0, c.1) => a.to_data(c.0, c.1).0,
+            _ => 0.5 * (t0 + t1),
+        }
+    }
+
+    /// The loudness strip's rectangle, in device pixels.
+    fn strip(&self) -> Option<spectro_core::render::Plot> {
+        let g = self.gfx.as_ref()?;
+        let size = g.window.inner_size();
+        Some(strip_rect(size.width as usize, size.height as usize, g.window.scale_factor() as f32))
+    }
+
+    /// Scroll: pan in time (Alt: in frequency); Cmd or Ctrl: zoom in time.
+    fn scroll(&mut self, dx: f64, dy: f64) {
+        let Some(axes) = self.axes() else { return };
+        let zoom = if cfg!(target_os = "macos") { self.mods.super_key() } else { self.mods.control_key() };
+        if zoom {
+            self.zoom_time_by((-dy / 300.0).exp(), self.anchor_time());
+        } else if self.mods.alt_key() {
+            let (f0, f1) = self.freq_range();
+            let df = dy * (f1 - f0) / axes.plot.h.max(1) as f64;
+            self.set_freq_range(f0 + df, f1 + df);
+        } else {
+            let (t0, t1) = self.time_range();
+            let dt = -(dx + dy) * (t1 - t0) / axes.plot.w.max(1) as f64;
+            self.set_time_range(t0 + dt, t1 + dt);
+        }
     }
 
     /// The region between the drag start and the pointer.
@@ -188,6 +285,16 @@ impl App {
         match state {
             ElementState::Pressed => {
                 let Some(cur) = self.cursor else { return };
+                // A click in the loudness strip centres the view there.
+                if let (Some(e), true, Some(_)) = (self.strip(), self.zoom_time.is_some(), &self.overview) {
+                    let inside = cur.0 >= e.x as f32 && cur.0 < (e.x + e.w) as f32;
+                    if inside && cur.1 >= e.y as f32 && cur.1 < (e.y + e.h) as f32 {
+                        let t = (cur.0 - e.x as f32) as f64 / e.w as f64 * self.duration();
+                        let (t0, t1) = self.time_range();
+                        self.set_time_range(t - (t1 - t0) / 2.0, t + (t1 - t0) / 2.0);
+                        return;
+                    }
+                }
                 if self.axes().is_some_and(|a| a.contains(cur.0, cur.1)) {
                     self.drag = Some(cur);
                     self.redraw_cursor();
@@ -242,7 +349,10 @@ impl App {
             stream: self.stream,
             channel: self.channel,
             channels: s.channels as usize,
+            sample_rate: s.sample_rate,
             samples: s.samples(),
+            t0: self.time_range().0,
+            t1: self.time_range().1,
             fft_bits: self.settings.fft_bits,
             window: self.settings.window,
             columns,
@@ -319,6 +429,19 @@ impl App {
                                 row("Drag", "Select a region: it loops, filtered to its band"),
                                 row("Space", "Stop or restart the loop"),
                                 row("Click  Esc", "Clear the selection"),
+                            ],
+                        ),
+                        section(
+                            "Zoom",
+                            vec![
+                                row("Pinch", "Zoom in time around the pointer"),
+                                row(&format!("{cmd}  Scroll"), "Zoom in time, with a mouse"),
+                                row("+  -", "Zoom in or out"),
+                                row("Z", "Zoom into the selected box"),
+                                row("0", "Show the whole file"),
+                                row("Scroll", "Move along in time (also Left and Right)"),
+                                row("Alt  Scroll", "Move up or down in frequency"),
+                                row("", "Click the loudness strip to jump there"),
                             ],
                         ),
                         section(
@@ -408,6 +531,12 @@ impl App {
         let guard = job.as_ref().and_then(|j| j.lock().ok());
         let spec = guard.as_ref().map(|g| &g.spectrogram);
         let mut v = crate::view(&title, &desc, self.current(), spec, &self.settings, scale);
+        v.time_range = self.time_range();
+        v.freq_range = self.freq_range();
+        if let Some(j) = &self.job {
+            v.data_range = (j.request.t0, j.request.t1);
+        }
+        v.overview = self.overview.as_deref();
         v.message = message.as_deref();
         v.panel = panel.as_ref().map(|(title, sections)| RenderPanel { title, sections, footer: "Esc to close" });
         v.cursor = if self.panel == Panel::None && self.drag.is_none() { self.cursor } else { None };
@@ -481,6 +610,8 @@ impl App {
             Key::Named(NamedKey::F1) => Action::Help,
             Key::Named(NamedKey::Escape) => Action::ClearSelection,
             Key::Named(NamedKey::Space) => Action::TogglePlay,
+            Key::Named(NamedKey::ArrowLeft) => Action::Pan(-2),
+            Key::Named(NamedKey::ArrowRight) => Action::Pan(2),
             Key::Character(s) if command => match s.to_lowercase().as_str() {
                 "o" => Action::Open,
                 "s" => Action::Save,
@@ -488,11 +619,18 @@ impl App {
                 "e" | "," => Action::Settings,
                 "?" | "/" => Action::Help,
                 "q" | "w" => Action::Close,
+                "=" | "+" => Action::ZoomIn,
+                "-" => Action::ZoomOut,
+                "0" => Action::ZoomReset,
                 _ => return,
             },
             Key::Character(s) => {
                 let mut chars = s.chars();
                 match (chars.next(), chars.next()) {
+                    (Some('=' | '+'), None) => Action::ZoomIn,
+                    (Some('-'), None) => Action::ZoomOut,
+                    (Some('0'), None) => Action::ZoomReset,
+                    (Some('z' | 'Z'), None) => Action::ZoomToSelection,
                     (Some(c), None) => Action::Key(c),
                     _ => return,
                 }
@@ -576,6 +714,23 @@ impl App {
                 }
             }
             Action::Set(key, value) => self.change_settings(|s| s.set(&key, &value)),
+            Action::ZoomIn => self.zoom_time_by(0.5, self.anchor_time()),
+            Action::ZoomOut => self.zoom_time_by(2.0, self.anchor_time()),
+            Action::ZoomReset => {
+                self.zoom_freq = None;
+                let dur = self.duration();
+                self.set_time_range(0.0, dur);
+            }
+            Action::ZoomToSelection => {
+                let Some(r) = self.selection else { return };
+                self.set_time_range(r.t0, r.t1);
+                self.set_freq_range(r.f0, r.f1);
+            }
+            Action::Pan(n) => {
+                let (t0, t1) = self.time_range();
+                let dt = (t1 - t0) * n as f64 / 10.0;
+                self.set_time_range(t0 + dt, t1 + dt);
+            }
             Action::Key(c) => {
                 let streams = self.streams.as_ref().map_or(0, |s| s.len());
                 let channels = self.current().map_or(0, |s| s.channels as usize);
@@ -583,10 +738,14 @@ impl App {
                 match c {
                     'c' | 'C' if channels > 0 => {
                         self.channel = step(self.channel, channels, c == 'c');
+                        self.overview = None;
                         self.restart();
                     }
                     's' | 'S' if streams > 0 => {
                         self.clear_selection();
+                        self.zoom_time = None;
+                        self.zoom_freq = None;
+                        self.overview = None;
                         self.stream = step(self.stream, streams, c == 's');
                         let ch = self.current().map_or(1, |s| s.channels.max(1) as usize);
                         self.channel = self.channel.min(ch - 1);
@@ -598,6 +757,21 @@ impl App {
         }
         self.sync_menu();
         self.redraw_later();
+    }
+
+    /// Keeps the loudness of the whole file once a full analysis finishes,
+    /// so the strip can show it while zoomed.
+    fn capture_overview(&mut self) {
+        let Some(job) = &self.job else { return };
+        let full = job.request.t0 <= 0.0 && job.request.t1 >= self.duration() - 1e-9;
+        if !full || self.overview.is_some() {
+            return;
+        }
+        if let Ok(sh) = job.shared.lock()
+            && sh.spectrogram.filled() == sh.spectrogram.columns()
+        {
+            self.overview = Some(sh.spectrogram.envelopes().to_vec());
+        }
     }
 
     fn sync_menu(&mut self) {
@@ -648,7 +822,7 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Progress => {}
+            UserEvent::Progress => self.capture_overview(),
             UserEvent::Menu(id) => {
                 if let Some(a) = Action::parse(&id) {
                     self.act(event_loop, a);
@@ -681,6 +855,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw_cursor();
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => self.mouse(state),
+            WindowEvent::MouseWheel { delta, .. } if self.panel == Panel::None => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x as f64 * 40.0, y as f64 * 40.0),
+                    MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
+                };
+                self.scroll(dx, dy);
+            }
+            WindowEvent::PinchGesture { delta, .. } if self.panel == Panel::None => {
+                self.zoom_time_by((1.0 - delta).clamp(0.2, 5.0), self.anchor_time());
+            }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = None;
                 self.redraw_cursor();

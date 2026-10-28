@@ -26,6 +26,13 @@ spectrograms around.
   as pills. A loudness waveform runs above the spectrogram, and a
   scanline sweeps across while it is analysed. Hover to get a crosshair
   that reads out time, frequency and level.
+- **Zoom.** Pinch, Cmd-scroll (Ctrl-scroll elsewhere), or `+` and `-` zoom
+  in time around the pointer. Drag a box and press `Z` to zoom into its
+  time and frequency range, and `0` shows the whole file again. Scroll or
+  use the arrow keys to move along, and Alt-scroll to move in frequency.
+  The zoomed stretch is re-analysed at full detail, not just stretched.
+  While zoomed, the loudness strip shows the whole file with the visible
+  part marked; click it to jump.
 - **Listen to a region.** Drag a box over any part of the spectrogram to
   hear just that: the time span loops, and an FFT filter silences every
   frequency outside the box. The rest of the picture dims and a playhead
@@ -85,6 +92,8 @@ a window:
 spectro -o song.png --width 1600 --height 900 --scale 2 song.flac
 ```
 
+Add `--time 1:20-1:35` and `--freq 200-4000` to render a zoomed view.
+
 `spectro --help` lists every option: stream, channel, palette, window
 function, window size and dynamic range.
 
@@ -92,7 +101,7 @@ function, window size and dynamic range.
 
 On macOS spectro has a native menu bar:
 - **File**: Open, Open Recent, Save Image, Show in Finder, Close Window.
-- **View**: palette, frequency scale, window function, window size, dynamic
+- **View**: zoom in, zoom out, zoom to selection, show whole file, palette, frequency scale, window function, window size, dynamic
   range, glow, channel and stream. The current choices are checked.
 - **Playback**: play, stop or clear the selected region.
 - **Window** and **Help**.
@@ -109,6 +118,11 @@ On macOS use Cmd instead of Ctrl.
 | Drag | Select a region and loop it, filtered to its frequency band |
 | Click | Clear the selection |
 | `Space` | Stop or restart the loop |
+| Pinch, `Cmd`-scroll, `+`, `-` | Zoom in or out in time |
+| `Z` | Zoom into the selected box |
+| `0`, `Cmd-0` | Show the whole file |
+| Scroll, Left, Right | Move along in time |
+| `Alt`-scroll | Move up or down in frequency |
 | `Ctrl-O` | Open a file |
 | `Ctrl-S` | Save the picture as PNG |
 | `Cmd-Shift-R` | Show the file in Finder (macOS) |
@@ -140,7 +154,7 @@ Windows).
   network.
 - The picture is redesigned (see above). For Spek's colours, use
   `-p spectrum --glow off`, or press `p` and `g`.
-- Extra: listening to a selected region, the hover readout, the loudness waveform, the frequency scales,
+- Extra: zoom, listening to a selected region, the hover readout, the loudness waveform, the frequency scales,
   the glow, three new palettes, and `--output` with the other command-line
   options.
 

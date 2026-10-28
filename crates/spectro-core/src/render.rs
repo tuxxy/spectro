@@ -10,7 +10,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::analysis::Spectrogram;
+use crate::analysis::{Envelope, Spectrogram};
 use crate::canvas::{Canvas, RoundRect, mix};
 use crate::font::{Text, Weight};
 use crate::math;
@@ -50,6 +50,15 @@ fn mel(f: f64) -> f64 {
     2595.0 * math::log10(1.0 + f / 700.0)
 }
 
+fn mel_inv(m: f64) -> f64 {
+    700.0 * (math::exp(m / 2595.0 * core::f64::consts::LN_10) - 1.0)
+}
+
+/// The lowest frequency a log axis shows: 20 Hz, or the band's own bottom.
+fn log_floor(lo: f64, hi: f64) -> f64 {
+    lo.max(LOG_MIN_HZ.min(hi * 0.5))
+}
+
 impl FreqScale {
     pub const ALL: [FreqScale; 3] = [FreqScale::Linear, FreqScale::Mel, FreqScale::Log];
 
@@ -81,26 +90,30 @@ impl FreqScale {
         crate::cycle(&Self::ALL, self, -1)
     }
 
-    /// Frequency at height fraction `u` (0 at the bottom, 1 at the top).
-    pub fn freq(self, u: f64, nyquist: f64) -> f64 {
+    /// Frequency at height fraction `u` (0 at the bottom, 1 at the top) of
+    /// a plot showing `lo..hi` hertz.
+    pub fn freq(self, u: f64, lo: f64, hi: f64) -> f64 {
         match self {
-            FreqScale::Linear => u * nyquist,
-            FreqScale::Mel => 700.0 * (math::exp(u * mel(nyquist) / 2595.0 * core::f64::consts::LN_10) - 1.0),
+            FreqScale::Linear => lo + u * (hi - lo),
+            FreqScale::Mel => {
+                let (a, b) = (mel(lo), mel(hi));
+                mel_inv(a + u * (b - a))
+            }
             FreqScale::Log => {
-                let lo = LOG_MIN_HZ.min(nyquist * 0.5);
-                lo * math::exp(u * math::ln(nyquist / lo))
+                let lo = log_floor(lo, hi);
+                lo * math::exp(u * math::ln(hi / lo))
             }
         }
     }
 
     /// Height fraction of frequency `f`; the inverse of [`FreqScale::freq`].
-    pub fn frac(self, f: f64, nyquist: f64) -> f64 {
+    pub fn frac(self, f: f64, lo: f64, hi: f64) -> f64 {
         match self {
-            FreqScale::Linear => f / nyquist,
-            FreqScale::Mel => mel(f) / mel(nyquist),
+            FreqScale::Linear => (f - lo) / (hi - lo),
+            FreqScale::Mel => (mel(f) - mel(lo)) / (mel(hi) - mel(lo)),
             FreqScale::Log => {
-                let lo = LOG_MIN_HZ.min(nyquist * 0.5);
-                if f <= 0.0 { f64::NEG_INFINITY } else { math::ln(f / lo) / math::ln(nyquist / lo) }
+                let lo = log_floor(lo, hi);
+                if f <= 0.0 { f64::NEG_INFINITY } else { math::ln(f / lo) / math::ln(hi / lo) }
             }
         }
     }
@@ -114,8 +127,19 @@ pub struct View<'a> {
     pub title: &'a str,
     /// Comma-separated details (codec, rate, channel, window), shown as pills.
     pub description: &'a str,
-    /// Seconds; 0 hides the time axis.
+    /// Length of the whole file in seconds; 0 hides the time axis.
     pub duration: f64,
+    /// The seconds shown across the plot (the whole file unless zoomed).
+    pub time_range: (f64, f64),
+    /// The hertz shown up the plot (0 to Nyquist unless zoomed).
+    pub freq_range: (f64, f64),
+    /// The seconds the spectrogram's columns cover. While a zoom is being
+    /// re-analysed this still describes the old data, which is stretched
+    /// to fit until the new columns arrive.
+    pub data_range: (f64, f64),
+    /// Loudness of the whole file, for the strip above the plot, which then
+    /// marks the visible part.
+    pub overview: Option<&'a [Envelope]>,
     /// Hz; 0 hides the frequency axis.
     pub sample_rate: u32,
     pub palette: Palette,
@@ -245,18 +269,34 @@ pub fn plot_rect(width: usize, height: usize, scale: f32) -> Plot {
     layout(width, height, scale).plot
 }
 
+/// The loudness strip above the plot, in device pixels.
+pub fn strip_rect(width: usize, height: usize, scale: f32) -> Plot {
+    layout(width, height, scale).envelope
+}
+
 /// Converts between device pixels and seconds/hertz on the plot.
 #[derive(Clone, Copy, Debug)]
 pub struct Axes {
     pub plot: Plot,
-    duration: f64,
-    nyquist: f64,
+    time: (f64, f64),
+    freq: (f64, f64),
     scale: FreqScale,
 }
 
 impl Axes {
-    pub fn new(width: usize, height: usize, ui_scale: f32, duration: f64, sample_rate: u32, scale: FreqScale) -> Self {
-        Axes { plot: plot_rect(width, height, ui_scale), duration, nyquist: sample_rate as f64 / 2.0, scale }
+    pub fn new(
+        width: usize,
+        height: usize,
+        ui_scale: f32,
+        time: (f64, f64),
+        freq: (f64, f64),
+        scale: FreqScale,
+    ) -> Self {
+        Axes { plot: plot_rect(width, height, ui_scale), time, freq, scale }
+    }
+
+    fn of(plot: Plot, v: &View) -> Self {
+        Axes { plot, time: v.time_range, freq: v.freq_range, scale: v.freq_scale }
     }
 
     /// Seconds and hertz under `(x, y)`, clamped to the plot.
@@ -264,20 +304,29 @@ impl Axes {
         let p = self.plot;
         let u = ((x - p.x as f32) / p.w.max(1) as f32).clamp(0.0, 1.0) as f64;
         let v = (((p.y + p.h) as f32 - y) / p.h.max(1) as f32).clamp(0.0, 1.0) as f64;
-        (u * self.duration, self.scale.freq(v, self.nyquist).max(0.0))
+        let (t0, t1) = self.time;
+        (t0 + u * (t1 - t0), self.scale.freq(v, self.freq.0, self.freq.1).max(0.0))
     }
 
-    /// Device pixel of seconds `t` and hertz `f`.
+    /// Device pixel of seconds `t` and hertz `f`, which may lie outside the plot.
     pub fn to_px(&self, t: f64, f: f64) -> (f32, f32) {
         let p = self.plot;
-        let u = if self.duration > 0.0 { t / self.duration } else { 0.0 };
-        let v = self.scale.frac(f.max(1e-9), self.nyquist).clamp(0.0, 1.0);
+        let (t0, t1) = self.time;
+        let u = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+        let v = self.scale.frac(f.max(1e-9), self.freq.0, self.freq.1).clamp(-1.0, 2.0);
         (p.x as f32 + (u * p.w as f64) as f32, (p.y + p.h) as f32 - (v * p.h as f64) as f32)
     }
 
     pub fn contains(&self, x: f32, y: f32) -> bool {
         self.plot.contains(x, y)
     }
+}
+
+/// A number with as many decimals as it needs, up to three.
+fn format_number(x: f64) -> String {
+    let t = format!("{x:.3}");
+    let t = t.trim_end_matches('0').trim_end_matches('.');
+    String::from(if t.is_empty() || t == "-" { "0" } else { t })
 }
 
 fn format_freq(f: f64) -> String {
@@ -417,7 +466,7 @@ impl Renderer {
         let p = l.plot;
         let spec = v.spectrogram.filter(|s| s.columns() > 0 && s.bands() > 1);
         if p.w > 0 && p.h > 0 {
-            self.envelope(c, &l, spec);
+            self.envelope(c, &l, spec, v);
             c.clip_round(l.envelope.round(l.radius * 0.7), bg_at);
             match spec {
                 Some(s) if s.filled() > 0 => self.spectrogram(c, &l, s, v),
@@ -494,35 +543,76 @@ impl Renderer {
         }
     }
 
-    fn envelope(&mut self, c: &mut Canvas, l: &Layout, spec: Option<&Spectrogram>) {
+    /// For each plot column `x`, the spectrogram column under it, if analysed.
+    fn column_map(width: usize, s: &Spectrogram, v: &View) -> Vec<Option<usize>> {
+        let (t0, t1) = v.time_range;
+        let (d0, d1) = v.data_range;
+        let cols = s.columns();
+        (0..width)
+            .map(|x| {
+                let t = t0 + (x as f64 + 0.5) / width as f64 * (t1 - t0);
+                if d1 <= d0 || t < d0 || t >= d1 {
+                    return None;
+                }
+                let ci = (((t - d0) / (d1 - d0)) * cols as f64) as usize;
+                Some(ci.min(cols - 1)).filter(|&ci| ci < s.filled())
+            })
+            .collect()
+    }
+
+    /// Draws one column of the loudness strip.
+    fn envelope_column(&self, c: &mut Canvas, l: &Layout, x: usize, env: Envelope) {
         let e = l.envelope;
+        let mid = e.y as f32 + e.h as f32 / 2.0;
+        let half = e.h as f32 / 2.0 - 4.0 * l.s;
+        let (hp, hr) = (env.peak.clamp(0.0, 1.0) * half, env.rms.clamp(0.0, 1.0) * half);
+        let (peak_color, rms_color) = (self.lut.sample(0.55), self.lut.sample(0.85));
+        let top = (mid - hp - 1.0).max(e.y as f32) as usize;
+        let bottom = ((mid + hp + 1.0) as usize).min((e.y + e.h) as usize);
+        for y in top..bottom {
+            let d = (y as f32 + 0.5 - mid).abs();
+            let px = c.get(e.x as usize + x, y);
+            let peak = (hp - d + 0.5).clamp(0.0, 1.0) * 0.45;
+            let rms = (hr - d + 0.5).clamp(0.0, 1.0) * 0.9;
+            let mut col = mix(px, quantize(peak_color, x, y), peak);
+            col = mix(col, quantize(rms_color, x, y), rms);
+            c.set(e.x + x as i64, y as i64, col);
+        }
+    }
+
+    /// The loudness strip: the whole file when an overview is available,
+    /// with the visible part marked; otherwise just the visible part.
+    fn envelope(&mut self, c: &mut Canvas, l: &Layout, spec: Option<&Spectrogram>, v: &View) {
+        let e = l.envelope;
+        let w = e.w as usize;
         c.fill(e.x, e.y, e.w, e.h, WELL, 1.0);
         let mid = e.y as f32 + e.h as f32 / 2.0;
         c.fill(e.x, mid as i64, e.w, l.hair as i64, WHITE, 0.05);
-        let Some(s) = spec else { return };
-        let peak_color = self.lut.sample(0.55);
-        let rms_color = self.lut.sample(0.85);
-        let half = e.h as f32 / 2.0 - 4.0 * l.s;
-        let height = |a: f32| a.clamp(0.0, 1.0) * half;
-        let cols = s.columns();
-        for x in 0..e.w as usize {
-            let ci = x * cols / e.w as usize;
-            if ci >= s.filled() {
-                break;
+        match (v.overview.filter(|o| !o.is_empty()), spec) {
+            (Some(all), _) if v.duration > 0.0 => {
+                for x in 0..w {
+                    self.envelope_column(c, l, x, all[(x * all.len() / w.max(1)).min(all.len() - 1)]);
+                }
+                let (t0, t1) = v.time_range;
+                if t0 > 1e-9 || t1 < v.duration - 1e-9 {
+                    let to_x = |t: f64| e.x + (t / v.duration * e.w as f64) as i64;
+                    let (x0, x1) = (to_x(t0), to_x(t1).max(to_x(t0) + 2));
+                    c.fill(e.x, e.y, x0 - e.x, e.h, 0x000000, 0.6);
+                    c.fill(x1, e.y, e.x + e.w - x1, e.h, 0x000000, 0.6);
+                    let accent = quantize(self.lut.sample(0.93), 0, 0);
+                    let t = (1.5 * l.s).max(1.0) as i64;
+                    c.fill(x0, e.y, t, e.h, accent, 0.9);
+                    c.fill(x1 - t, e.y, t, e.h, accent, 0.9);
+                }
             }
-            let env = s.envelope(ci);
-            let (hp, hr) = (height(env.peak), height(env.rms));
-            let top = (mid - hp - 1.0).max(e.y as f32) as usize;
-            let bottom = ((mid + hp + 1.0) as usize).min((e.y + e.h) as usize);
-            for y in top..bottom {
-                let d = (y as f32 + 0.5 - mid).abs();
-                let px = c.get(e.x as usize + x, y);
-                let peak = (hp - d + 0.5).clamp(0.0, 1.0) * 0.45;
-                let rms = (hr - d + 0.5).clamp(0.0, 1.0) * 0.9;
-                let mut col = mix(px, quantize(peak_color, x, y), peak);
-                col = mix(col, quantize(rms_color, x, y), rms);
-                c.set(e.x + x as i64, y as i64, col);
+            (_, Some(s)) => {
+                for (x, ci) in Self::column_map(w, s, v).into_iter().enumerate() {
+                    if let Some(ci) = ci {
+                        self.envelope_column(c, l, x, s.envelope(ci));
+                    }
+                }
             }
+            _ => {}
         }
     }
 
@@ -530,17 +620,16 @@ impl Renderer {
         let p = l.plot;
         let (pw, ph) = (p.w as usize, p.h as usize);
         let bands = s.bands();
-        let cols = s.columns();
-        let filled_px = (s.filled() * pw).div_ceil(cols).min(pw);
+        let map = Self::column_map(pw, s, v);
         // Each pixel row covers a band interval (low frequencies at the
         // bottom). Rows spanning several bands take the loudest, so thin
         // tones survive; rows within one band interpolate smoothly.
-        let (scale, nyquist) = match v.sample_rate {
-            0 => (FreqScale::Linear, 1.0),
-            r => (v.freq_scale, r as f64 / 2.0),
+        let (scale, nyquist, lo, hi) = match v.sample_rate {
+            0 => (FreqScale::Linear, 1.0, 0.0, 1.0),
+            r => (v.freq_scale, r as f64 / 2.0, v.freq_range.0, v.freq_range.1),
         };
         let band_at =
-            |u: f64| (scale.freq(u, nyquist) / nyquist * (bands - 1) as f64).clamp(0.0, (bands - 1) as f64) as f32;
+            |u: f64| (scale.freq(u, lo, hi) / nyquist * (bands - 1) as f64).clamp(0.0, (bands - 1) as f64) as f32;
         let rows: Vec<(f32, usize, usize)> = (0..ph)
             .map(|y| {
                 let top = band_at((ph - y) as f64 / ph as f64);
@@ -554,8 +643,9 @@ impl Renderer {
         let lower = v.lower_db as f32;
         self.levels.clear();
         self.levels.resize(pw * ph, 0.0);
-        for x in 0..filled_px {
-            let col = s.column(x * cols / pw);
+        for (x, ci) in map.iter().enumerate() {
+            let Some(ci) = *ci else { continue };
+            let col = s.column(ci);
             for (y, &(mid, lo, hi)) in rows.iter().enumerate() {
                 let db = if hi > lo {
                     col[lo..=hi].iter().copied().fold(f32::MIN, f32::max)
@@ -578,12 +668,12 @@ impl Renderer {
 
         // Bloom: bright parts, blurred at half resolution, screened back on.
         let (gw, gh) = (pw.div_ceil(2), ph.div_ceil(2));
-        let glow = v.glow && filled_px > 0;
+        let glow = v.glow && map.iter().any(Option::is_some);
         if glow {
             self.glow.clear();
             self.glow.resize(gw * gh, [0.0; 3]);
             for y in 0..ph {
-                for x in 0..filled_px {
+                for x in (0..pw).filter(|&x| map[x].is_some()) {
                     let col = self.lut.sample(self.levels[y * pw + x]);
                     let lum = (0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]) / 255.0;
                     let k = ((lum - 0.42) / 0.58).clamp(0.0, 1.0);
@@ -602,7 +692,7 @@ impl Renderer {
             let row = c.row_mut(p.y as usize + y);
             for x in 0..pw {
                 let out = &mut row[p.x as usize + x];
-                if x >= filled_px {
+                if map[x].is_none() {
                     *out = WELL;
                     continue;
                 }
@@ -628,22 +718,27 @@ impl Renderer {
         }
 
         // Progress scanline at the analysis front.
-        if filled_px < pw {
-            let accent = self.lut.sample(0.92);
-            let fade = 28.0 * l.s;
-            for y in 0..ph {
-                for d in 0..fade as usize {
-                    let x = filled_px as i64 - 1 - d as i64;
-                    if x < 0 {
-                        break;
+        if s.filled() < s.columns() {
+            let (d0, d1) = v.data_range;
+            let front = d0 + (d1 - d0) * s.filled() as f64 / s.columns() as f64;
+            let (t0, t1) = v.time_range;
+            let fx = ((front - t0) / (t1 - t0) * pw as f64) as i64;
+            if (0..=pw as i64).contains(&fx) {
+                let accent = self.lut.sample(0.92);
+                let fade = 28.0 * l.s;
+                for y in 0..ph {
+                    for d in 0..fade as usize {
+                        let x = fx - 1 - d as i64;
+                        if x < 0 {
+                            break;
+                        }
+                        let k = 1.0 - d as f32 / fade;
+                        c.blend(p.x + x, p.y + y as i64, quantize(accent, x as usize, y), 0.4 * k * k);
                     }
-                    let k = 1.0 - d as f32 / fade;
-                    let a = 0.4 * k * k;
-                    c.blend(p.x + x, p.y + y as i64, quantize(accent, x as usize, y), a);
                 }
+                let t = (1.5 * l.s) as i64;
+                c.fill(p.x + fx - t, p.y, t, p.h, quantize(accent, 0, 0), 0.9);
             }
-            let t = (1.5 * l.s) as i64;
-            c.fill(p.x + filled_px as i64 - t, p.y, t, p.h, quantize(accent, 0, 0), 0.9);
         }
     }
 
@@ -653,82 +748,69 @@ impl Renderer {
         let lh = self.text.line_height(Weight::Regular, l.label_px);
         let hair = l.hair as i64;
         if v.sample_rate > 0 {
-            let nyquist = v.sample_rate as f64 / 2.0;
+            let (lo, hi) = v.freq_range;
             let scale = v.freq_scale;
             let gap = (lh * 2.4) as f64;
-            let values = match scale {
+            let y_of = |f: f64| (p.y + p.h) as f64 - scale.frac(f, lo, hi) * p.h as f64;
+            let bottom = scale.freq(0.0, lo, hi);
+            let candidates: Vec<f64> = match scale {
                 FreqScale::Linear => {
-                    let steps = [100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0];
-                    ticks(0.0, nyquist, p.h as f64 / nyquist, gap, &steps).1
+                    let steps = [
+                        1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
+                        50000.0,
+                    ];
+                    ticks(lo, hi, p.h as f64 / (hi - lo), gap, &steps).1
                 }
-                _ => {
-                    // Round values, kept where they do not crowd the one below.
-                    let mut out: Vec<f64> = Vec::new();
-                    if scale == FreqScale::Mel {
-                        out.push(0.0);
-                    }
-                    for e in [10.0, 100.0, 1000.0, 10000.0, 100000.0] {
-                        for m in [1.0, 2.0, 5.0] {
-                            let f = m * e;
-                            let fr = scale.frac(f, nyquist);
-                            if !(0.0..=1.0).contains(&fr) {
-                                continue;
-                            }
-                            let far = out.last().is_none_or(|&last| {
-                                let lf = scale.frac(last, nyquist).max(0.0);
-                                (fr - lf) * p.h as f64 >= gap
-                            });
-                            if far {
-                                out.push(f);
-                            }
-                        }
-                    }
-                    out
-                }
+                _ => [1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0]
+                    .iter()
+                    .flat_map(|e| [1.0, 2.0, 5.0].map(|m| m * e))
+                    .collect(),
             };
-            // The top edge is always labelled with the true maximum (the
-            // Nyquist frequency), so the full range is visible at a glance.
-            let mut values: Vec<f64> =
-                values.into_iter().filter(|&f| (1.0 - scale.frac(f, nyquist)) * p.h as f64 >= gap).collect();
-            values.push(nyquist);
-            let top = nyquist;
+            // Both edges are labelled with their true values, so the range
+            // shown is always clear; round values fill in between.
+            let mut values = Vec::from([bottom]);
+            for f in candidates {
+                let y = y_of(f);
+                let clear_top = y - p.y as f64 >= gap;
+                let clear_last = values.last().is_none_or(|&last| y_of(last) - y >= gap);
+                if f > bottom && f < hi && clear_top && clear_last {
+                    values.push(f);
+                }
+            }
+            values.push(hi);
+            let khz = hi >= 2000.0;
             for &f in &values {
-                let y = (p.y + p.h) as f64 - scale.frac(f, nyquist).max(0.0) * p.h as f64;
-                if f > 0.0 && f < nyquist {
+                let y = y_of(f);
+                if f > bottom && f < hi {
                     c.fill(p.x, math::round(y) as i64, p.w, hair, WHITE, 0.07);
                 }
-                let khz = f / 1000.0;
-                let mut label = if khz == math::floor(khz) {
-                    format!("{}", khz as i64)
-                } else {
-                    let t = format!("{khz:.2}");
-                    String::from(t.trim_end_matches('0'))
-                };
-                if f == top {
-                    label.push_str(" kHz");
+                let mut label = if khz { format_number(f / 1000.0) } else { format_number(f) };
+                if f == hi {
+                    label.push_str(if khz { " kHz" } else { " Hz" });
                 }
                 let tw = self.text.width(Weight::Regular, l.label_px, &label);
-                let ly = (y as f32 - lh / 2.0).max(p.y as f32 - lh * 0.3);
+                let ly = (y as f32 - lh / 2.0).clamp(p.y as f32 - lh * 0.3, (p.y + p.h) as f32 - lh * 0.7);
                 self.text.draw(c, Weight::Regular, l.label_px, (p.x as f32 - 10.0 * s - tw, ly), TEXT_DIM, &label);
             }
         }
-        if v.duration > 0.0 {
-            let px = p.w as f64 / v.duration;
-            let sample = self.text.width(Weight::Regular, l.label_px, "00:00");
+        let (t0, t1) = v.time_range;
+        if v.duration > 0.0 && t1 > t0 {
+            let px = p.w as f64 / (t1 - t0);
+            let sample = self.text.width(Weight::Regular, l.label_px, "00:00.0");
             let steps = [
-                0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0,
-                7200.0,
+                0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0,
+                1800.0, 3600.0, 7200.0,
             ];
-            let (step, values) = ticks(0.0, v.duration, px, (sample * 2.4) as f64, &steps);
+            let (step, values) = ticks(t0, t1, px, (sample * 2.0) as f64, &steps);
             let y = (p.y + p.h) as f32 + 9.0 * s;
             for &t in &values {
-                let x = p.x as f64 + t * px;
-                if t > 0.0 && t < v.duration {
+                let x = p.x as f64 + (t - t0) * px;
+                if t > t0 && t < t1 {
                     c.fill(math::round(x) as i64, p.y, hair, p.h, WHITE, 0.07);
                 }
                 let mut label = format_time(t, step < 1.0);
-                if step < 1.0 {
-                    label.pop(); // steps are tenths, so show one decimal
+                if (0.1..1.0).contains(&step) {
+                    label.pop(); // tenths: one decimal is enough
                 }
                 let tw = self.text.width(Weight::Regular, l.label_px, &label);
                 let lx = (x as f32 - tw / 2.0).max(p.x as f32);
@@ -773,10 +855,13 @@ impl Renderer {
 
     fn selection(&mut self, c: &mut Canvas, l: &Layout, v: &View, sel: Selection) {
         let p = l.plot;
-        let axes = Axes { plot: p, duration: v.duration, nyquist: v.sample_rate as f64 / 2.0, scale: v.freq_scale };
+        let axes = Axes::of(p, v);
         let (xa, ya) = axes.to_px(sel.t0.min(sel.t1), sel.f0.max(sel.f1));
         let (xb, yb) = axes.to_px(sel.t0.max(sel.t1), sel.f0.min(sel.f1));
-        let (x0, y0, x1, y1) = (xa as i64, ya as i64, (xb as i64).max(xa as i64 + 1), (yb as i64).max(ya as i64 + 1));
+        let cx = |x: f32| (x as i64).clamp(p.x, p.x + p.w);
+        let cy = |y: f32| (y as i64).clamp(p.y, p.y + p.h);
+        let (x0, y0) = (cx(xa), cy(ya));
+        let (x1, y1) = (cx(xb).max(x0 + 1), cy(yb).max(y0 + 1));
         // Spotlight: dim everything around the box.
         let dim = 0.55;
         c.fill(p.x, p.y, p.w, y0 - p.y, 0x000000, dim);
@@ -788,10 +873,16 @@ impl Renderer {
         c.stroke_round(box_rr, 1.5 * l.s, accent, 0.95);
 
         if let Some(pos) = sel.playhead {
-            let (px, _) = axes.to_px(sel.t0.min(sel.t1) + pos, 0.0);
+            let t = sel.t0.min(sel.t1) + pos;
+            let (px, _) = axes.to_px(t, 0.0);
             let w = (1.5 * l.s).max(1.0) as i64;
-            c.fill(px as i64, y0, w, y1 - y0, accent, 0.9);
-            c.fill(px as i64, l.envelope.y, w, l.envelope.h, accent, 0.8);
+            if (p.x..p.x + p.w).contains(&(px as i64)) {
+                c.fill(px as i64, y0, w, y1 - y0, accent, 0.9);
+            }
+            // The strip shows the whole file when it has an overview.
+            let e = l.envelope;
+            let sx = if v.overview.is_some() { e.x as f32 + (t / v.duration * e.w as f64) as f32 } else { px };
+            c.fill(sx as i64, e.y, w, e.h, accent, 0.8);
         }
 
         let (t0, t1) = (sel.t0.min(sel.t1), sel.t0.max(sel.t1));
@@ -827,26 +918,30 @@ impl Renderer {
         let x = cx as i64;
         let y = cy as i64;
         let hair = l.hair as i64;
-        c.fill(x, l.envelope.y, hair, l.envelope.h, WHITE, 0.35);
         c.fill(x, p.y, hair, p.h, WHITE, 0.3);
         c.fill(p.x, y, p.w, hair, WHITE, 0.3);
 
-        let fx = (cx - p.x as f32) / p.w as f32;
-        let fy = ((p.y + p.h) as f32 - cy) / p.h as f32;
-        let ci = ((fx * s.columns() as f32) as usize).min(s.columns() - 1);
+        let (t, f) = Axes::of(p, v).to_data(cx, cy);
+        // The strip shows the whole file when it has an overview.
+        let e = l.envelope;
+        let sx = if v.overview.is_some() && v.duration > 0.0 { e.x + (t / v.duration * e.w as f64) as i64 } else { x };
+        c.fill(sx, e.y, hair, e.h, WHITE, 0.35);
         let mut parts = Vec::new();
         if v.duration > 0.0 {
-            parts.push(format_time(fx as f64 * v.duration, true));
+            parts.push(format_time(t, true));
         }
         let nyquist = v.sample_rate as f64 / 2.0;
-        let f = if v.sample_rate > 0 { v.freq_scale.freq(fy as f64, nyquist) } else { 0.0 };
         if v.sample_rate > 0 {
-            let f = f as f32;
-            parts.push(format_freq(f as f64));
+            parts.push(format_freq(f));
         }
-        if ci < s.filled() {
-            let at = if v.sample_rate > 0 { f / nyquist } else { fy as f64 };
-            let band = math::round(at * (s.bands() - 1) as f64) as usize;
+        let (d0, d1) = v.data_range;
+        let ci = if d1 > d0 && t >= d0 && t < d1 {
+            ((((t - d0) / (d1 - d0)) * s.columns() as f64) as usize).min(s.columns() - 1)
+        } else {
+            usize::MAX
+        };
+        if ci < s.filled() && v.sample_rate > 0 {
+            let band = math::round(f / nyquist * (s.bands() - 1) as f64) as usize;
             let db = s.column(ci)[band.min(s.bands() - 1)];
             parts.push(format!("{db:.1} dB").replace('-', "\u{2212}"));
         }
@@ -1038,31 +1133,39 @@ mod tests {
     #[test]
     fn freq_scales_invert() {
         for scale in FreqScale::ALL {
-            for f in [30.0, 440.0, 1000.0, 9000.0, 22050.0] {
-                let u = scale.frac(f, 22050.0);
-                assert!((0.0..=1.0 + 1e-9).contains(&u), "{scale:?} {f}");
-                assert!((scale.freq(u, 22050.0) - f).abs() < 1e-6 * f, "{scale:?} {f}");
+            for (lo, hi) in [(0.0, 22050.0), (300.0, 5000.0)] {
+                for f in [440.0, 1000.0, 4000.0] {
+                    let u = scale.frac(f, lo, hi);
+                    assert!((0.0..=1.0 + 1e-9).contains(&u), "{scale:?} {f}");
+                    assert!((scale.freq(u, lo, hi) - f).abs() < 1e-6 * f, "{scale:?} {f}");
+                }
+                assert!((scale.freq(1.0, lo, hi) - hi).abs() < 1e-6 * hi);
             }
         }
         // Mel gives music room: 0-4 kHz takes over half the height.
-        assert!(FreqScale::Mel.frac(4000.0, 22050.0) > 0.5);
+        assert!(FreqScale::Mel.frac(4000.0, 0.0, 22050.0) > 0.5);
     }
 
     #[test]
     fn axes_round_trip() {
         for scale in FreqScale::ALL {
-            let a = Axes::new(1200, 700, 1.0, 30.0, 44100, scale);
-            let (x, y) = a.to_px(12.5, 3000.0);
-            assert!(a.contains(x, y));
-            let (t, f) = a.to_data(x, y);
-            assert!((t - 12.5).abs() < 0.05, "{scale:?} {t}");
-            assert!((f - 3000.0).abs() < 60.0, "{scale:?} {f}");
+            for (time, freq) in [((0.0, 30.0), (0.0, 22050.0)), ((10.0, 14.0), (1000.0, 5000.0))] {
+                let a = Axes::new(1200, 700, 1.0, time, freq, scale);
+                let (x, y) = a.to_px(12.5, 3000.0);
+                assert!(a.contains(x, y));
+                let (t, f) = a.to_data(x, y);
+                assert!((t - 12.5).abs() < 0.05, "{scale:?} {t}");
+                assert!((f - 3000.0).abs() < 60.0, "{scale:?} {f}");
+            }
         }
     }
 
     #[test]
     fn formats() {
         assert_eq!(format_time(83.456, true), "1:23.46");
+        assert_eq!(format_number(2.5), "2.5");
+        assert_eq!(format_number(20.0), "20");
+        assert_eq!(format_number(0.125), "0.125");
         assert_eq!(format_time(3725.0, false), "1:02:05");
         assert_eq!(split_path("/a/b/song.flac"), ("/a/b/", "song.flac"));
         assert_eq!(split_path("song.flac"), ("", "song.flac"));

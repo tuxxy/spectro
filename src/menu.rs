@@ -27,6 +27,12 @@ pub enum Action {
     Set(String, String),
     TogglePlay,
     ClearSelection,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    ZoomToSelection,
+    /// Moves the view by this many tenths of its width.
+    Pan(i32),
 }
 
 impl Action {
@@ -46,6 +52,11 @@ impl Action {
             Action::Set(k, v) => format!("set:{k}:{v}"),
             Action::TogglePlay => "play".into(),
             Action::ClearSelection => "clear-selection".into(),
+            Action::ZoomIn => "zoom-in".into(),
+            Action::ZoomOut => "zoom-out".into(),
+            Action::ZoomReset => "zoom-reset".into(),
+            Action::ZoomToSelection => "zoom-selection".into(),
+            Action::Pan(n) => format!("pan:{n}"),
         }
     }
 
@@ -61,8 +72,14 @@ impl Action {
             "help" => Action::Help,
             "play" => Action::TogglePlay,
             "clear-selection" => Action::ClearSelection,
+            "zoom-in" => Action::ZoomIn,
+            "zoom-out" => Action::ZoomOut,
+            "zoom-reset" => Action::ZoomReset,
+            "zoom-selection" => Action::ZoomToSelection,
             _ => {
-                if let Some(i) = id.strip_prefix("recent:") {
+                if let Some(n) = id.strip_prefix("pan:") {
+                    Action::Pan(n.parse().ok()?)
+                } else if let Some(i) = id.strip_prefix("recent:") {
                     Action::OpenRecent(i.parse().ok()?)
                 } else if let Some(c) = id.strip_prefix("key:") {
                     let mut chars = c.chars();
@@ -255,9 +272,15 @@ mod mac {
             );
             let (next_channel, prev_channel) = steps('c', 'C', "Channel");
             let (next_stream, prev_stream) = steps('s', 'S', "Stream");
+            let zoom_selection = item(Action::ZoomToSelection, "Zoom to Selection", Some("Z"));
             let view = submenu(
                 "View",
                 &[
+                    &item(Action::ZoomIn, "Zoom In", Some("CmdOrCtrl+Equal")),
+                    &item(Action::ZoomOut, "Zoom Out", Some("CmdOrCtrl+Minus")),
+                    &zoom_selection,
+                    &item(Action::ZoomReset, "Show Whole File", Some("CmdOrCtrl+Digit0")),
+                    &sep(),
                     &palette_menu,
                     &scale_menu,
                     &window_menu,
@@ -299,7 +322,7 @@ mod mac {
                 checks,
                 glow,
                 need_file: vec![save, reveal],
-                need_selection: vec![play, clear],
+                need_selection: vec![play, clear, zoom_selection],
             }
         }
 
@@ -345,6 +368,10 @@ mod mac {
         #[test]
         fn accelerators_parse() {
             for a in [
+                "CmdOrCtrl+Equal",
+                "CmdOrCtrl+Minus",
+                "CmdOrCtrl+Digit0",
+                "Z",
                 "CmdOrCtrl+O",
                 "CmdOrCtrl+Comma",
                 "CmdOrCtrl+Shift+Slash",
@@ -379,6 +406,11 @@ mod tests {
             Action::Set("palette".into(), "glacier".into()),
             Action::TogglePlay,
             Action::ClearSelection,
+            Action::ZoomIn,
+            Action::ZoomOut,
+            Action::ZoomReset,
+            Action::ZoomToSelection,
+            Action::Pan(-2),
         ];
         for a in all {
             assert_eq!(Action::parse(&a.id()), Some(a.clone()), "{}", a.id());

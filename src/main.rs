@@ -38,6 +38,8 @@ Options:
       --width PIXELS          image width for --output (default 1280)
       --height PIXELS         image height for --output (default 720)
       --scale FACTOR          layout scale for --output, e.g. 2 for HiDPI (default 1)
+      --time FROM-TO          zoom --output to a time range, e.g. 1:20-1:35 or 80-95.5
+      --freq LOW-HIGH         zoom --output to a frequency range in Hz, e.g. 200-4000
   -s, --stream N              audio stream, starting at 1
   -c, --channel N             audio channel, starting at 1
   -p, --palette NAME          ember, spectrum, sox, mono, glacier or aurora
@@ -55,7 +57,8 @@ Keys: Ctrl-O open, Ctrl-S save, Ctrl-E settings, F1 help (Cmd on macOS).
   w/W window size  u/U upper limit  l/L lower limit
   y/Y frequency scale  g glow
 Mouse: drag a box to loop that region, filtered to its band; Space stops
-or restarts it; a click or Esc clears it.
+or restarts it; a click or Esc clears it. Zoom with a pinch, Cmd/Ctrl-scroll,
++ and -, or Z for the selected box; scroll to move; 0 shows everything.
 
 Settings are kept in ~/.config/spectro/preferences. FFmpeg (ffmpeg and
 ffprobe on the PATH, or SPECTRO_FFMPEG / SPECTRO_FFPROBE) decodes the audio;
@@ -70,7 +73,23 @@ struct Args {
     scale: f32,
     stream: usize,
     channel: usize,
+    time: Option<(f64, f64)>,
+    freq: Option<(f64, f64)>,
     settings: Vec<(&'static str, String)>,
+}
+
+/// Seconds from `95.5`, `1:35.5` or `1:01:35`.
+fn parse_time(s: &str) -> Option<f64> {
+    s.split(':')
+        .try_fold(0.0, |acc, part| Some(acc * 60.0 + part.trim().parse::<f64>().ok()?))
+        .filter(|t| t.is_finite())
+}
+
+/// A `FROM-TO` pair of non-negative values, `FROM < TO`.
+fn parse_range(s: &str, value: impl Fn(&str) -> Option<f64>) -> Option<(f64, f64)> {
+    let (a, b) = s.split_once('-')?;
+    let (a, b) = (value(a)?, value(b)?);
+    (a >= 0.0 && b > a).then_some((a, b))
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -82,6 +101,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         scale: 1.0,
         stream: 0,
         channel: 0,
+        time: None,
+        freq: None,
         settings: Vec::new(),
     };
     let mut it = std::env::args_os().skip(1);
@@ -126,6 +147,15 @@ fn parse_args() -> Result<Option<Args>, String> {
                 args.scale =
                     v.parse::<f32>().ok().filter(|s| (0.5..=8.0).contains(s)).ok_or(format!("bad scale: {v}"))?;
             }
+            "--time" => {
+                let v = value()?;
+                args.time = Some(parse_range(&v, parse_time).ok_or(format!("bad time range: {v}"))?);
+            }
+            "--freq" => {
+                let v = value()?;
+                let hz = |s: &str| s.trim().parse::<f64>().ok().filter(|f| f.is_finite());
+                args.freq = Some(parse_range(&v, hz).ok_or(format!("bad frequency range: {v}"))?);
+            }
             "-s" | "--stream" => args.stream = number(value()?)?.saturating_sub(1),
             "-c" | "--channel" => args.channel = number(value()?)?.saturating_sub(1),
             "-p" | "--palette" => args.settings.push(("palette", value()?)),
@@ -155,6 +185,10 @@ pub fn view<'a>(
         title,
         description,
         duration: stream.map_or(0.0, |s| s.duration),
+        time_range: (0.0, stream.map_or(0.0, |s| s.duration)),
+        freq_range: (0.0, stream.map_or(1.0, |s| s.sample_rate.max(2) as f64 / 2.0)),
+        data_range: (0.0, stream.map_or(0.0, |s| s.duration)),
+        overview: None,
         sample_rate: stream.map_or(0, |s| s.sample_rate),
         palette: settings.palette,
         upper_db: settings.upper_db,
@@ -180,13 +214,25 @@ fn render_to_file(args: &Args, settings: &Settings, output: &Path) -> Result<(),
     if args.channel >= s.channels as usize {
         return Err(format!("there is no channel {}", args.channel + 1));
     }
+    let (t0, t1) = args.time.map_or((0.0, s.duration), |(a, b)| (a.min(s.duration), b.min(s.duration)));
+    if t1 - t0 < 0.01 {
+        return Err(format!("the time range is outside the file ({:.2} s long)", s.duration));
+    }
+    let nyquist = s.sample_rate as f64 / 2.0;
+    let (f0, f1) = args.freq.map_or((0.0, nyquist), |(a, b)| (a.min(nyquist), b.min(nyquist)));
+    if f1 - f0 < 1.0 {
+        return Err(format!("the frequency range is outside 0-{nyquist} Hz"));
+    }
     let plot = plot_rect(args.width, args.height, args.scale);
     let req = pipeline::Request {
         path: file.to_path_buf(),
         stream: args.stream,
         channel: args.channel,
         channels: s.channels as usize,
+        sample_rate: s.sample_rate,
         samples: s.samples(),
+        t0,
+        t1,
         fft_bits: settings.fft_bits,
         window: settings.window,
         columns: plot.w as usize,
@@ -195,7 +241,10 @@ fn render_to_file(args: &Args, settings: &Settings, output: &Path) -> Result<(),
     pipeline::run(&req, &AtomicBool::new(false), &mut |c| spec.set(c))?;
     let title = file.display().to_string();
     let desc = media::describe(&streams, args.stream, args.channel, 1 << settings.fft_bits, settings.window.name());
-    let v = view(&title, &desc, Some(s), Some(&spec), settings, args.scale);
+    let mut v = view(&title, &desc, Some(s), Some(&spec), settings, args.scale);
+    v.time_range = (t0, t1);
+    v.data_range = (t0, t1);
+    v.freq_range = (f0, f1);
     let mut canvas = Canvas::new(args.width, args.height, 0);
     Renderer::new().render(&mut canvas, &v);
     let png = spectro_core::png::encode(canvas.width(), canvas.height(), canvas.pixels());
@@ -228,5 +277,19 @@ fn main() -> ExitCode {
             eprintln!("spectro: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges_parse() {
+        assert_eq!(parse_range("1:20-1:35.5", parse_time), Some((80.0, 95.5)));
+        assert_eq!(parse_range("80-95", parse_time), Some((80.0, 95.0)));
+        assert_eq!(parse_range("1:00:00-1:00:01", parse_time), Some((3600.0, 3601.0)));
+        assert_eq!(parse_range("95-80", parse_time), None);
+        assert_eq!(parse_range("x-80", parse_time), None);
     }
 }

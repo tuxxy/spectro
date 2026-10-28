@@ -15,7 +15,12 @@ pub struct Request {
     pub stream: usize,
     pub channel: usize,
     pub channels: usize,
+    pub sample_rate: u32,
+    /// Samples in the whole stream.
     pub samples: u64,
+    /// The time range to analyse, in seconds.
+    pub t0: f64,
+    pub t1: f64,
     pub fft_bits: u32,
     pub window: WindowFunction,
     pub columns: usize,
@@ -27,8 +32,33 @@ pub fn run(req: &Request, cancel: &AtomicBool, emit: &mut impl FnMut(&Column)) -
     if req.columns == 0 {
         return Ok(());
     }
-    let mut decoder = Decoder::open(&req.path, req.stream, req.channel, req.channels)?;
-    let mut analyzer = Analyzer::new(req.fft_bits, req.window, req.samples, req.columns);
+    let sr = req.sample_rate.max(1) as f64;
+    let start = ((req.t0 * sr).round().max(0.0) as u64).min(req.samples);
+    let end = ((req.t1 * sr).round() as u64).clamp(start, req.samples);
+    let (mut decoder, mut analyzer) = if start == 0 && end == req.samples {
+        let decoder = Decoder::open(&req.path, req.stream, req.channel, req.channels, 0.0, None)?;
+        (decoder, Analyzer::new(req.fft_bits, req.window, req.samples, req.columns))
+    } else {
+        // Start a window early and stop a window late so the edge columns
+        // see real audio rather than padding.
+        let n = 1u64 << req.fft_bits;
+        let origin = start.saturating_sub(n);
+        let lead = start - origin;
+        let limit = lead + (end - start) + n;
+        let (from, length) = (origin as f64 / sr, Some(limit as f64 / sr));
+        let decoder = Decoder::open(&req.path, req.stream, req.channel, req.channels, from, length)?;
+        (decoder, Analyzer::with_range(req.fft_bits, req.window, lead, end - start, limit, req.columns))
+    };
+    feed(&mut decoder, &mut analyzer, req, cancel, emit)
+}
+
+fn feed(
+    decoder: &mut Decoder,
+    analyzer: &mut Analyzer,
+    req: &Request,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(&Column),
+) -> Result<(), String> {
     let mut block = Vec::new();
     while decoder.read(&mut block).map_err(|e| format!("Cannot decode: {e}"))? {
         if cancel.load(Ordering::Relaxed) {

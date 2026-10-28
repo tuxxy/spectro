@@ -128,9 +128,26 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn open(path: &Path, stream: usize, channel: usize, channels: usize) -> Result<Self, String> {
-        let mut child = Command::new(tool("ffmpeg"))
-            .args(["-v", "error", "-nostdin", "-i"])
+    /// Decodes from `start` seconds, for `length` seconds or to the end.
+    pub fn open(
+        path: &Path,
+        stream: usize,
+        channel: usize,
+        channels: usize,
+        start: f64,
+        length: Option<f64>,
+    ) -> Result<Self, String> {
+        let mut cmd = Command::new(tool("ffmpeg"));
+        cmd.args(["-v", "error", "-nostdin"]);
+        if start > 0.0 {
+            // Input seeking decodes and drops up to the exact sample.
+            cmd.arg("-ss").arg(format!("{start:.6}"));
+        }
+        if let Some(t) = length {
+            cmd.arg("-t").arg(format!("{t:.6}"));
+        }
+        let mut child = cmd
+            .arg("-i")
             .arg(input_arg(path))
             .arg("-map")
             .arg(format!("0:a:{stream}"))
