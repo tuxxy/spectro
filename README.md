@@ -1,11 +1,11 @@
 # spectro
 
-An acoustic spectrum analyser for audio files, written in Rust. It is a
-clone of [Spek](https://github.com/alexkay/spek): open a file and see its
-spectrogram, with the same layout, keys and options. The aim is a small,
-safe program that draws the best-looking spectrograms around.
+An acoustic spectrum analyser for audio files, written in Rust. It does
+everything [Spek](https://github.com/alexkay/spek) does, with the same keys
+and options, in a small, safe program that aims to draw the most beautiful
+spectrograms around.
 
-![spectro showing an MP3 with a 16 kHz encoder cutoff](docs/screenshot.png)
+![spectro showing a synthesised track: chords, a vibrato melody, drums and a rising sweep, with the MP3 encoder's 19 kHz cutoff at the top](docs/screenshot.png)
 
 ## Why
 
@@ -19,7 +19,18 @@ safe program that draws the best-looking spectrograms around.
   crash the decoder, never spectro. File names go to FFmpeg as plain
   arguments with the `file:` prefix, so they are never read as options or
   URLs.
+- **A modern look.** The spectrogram sits in a rounded well on a dark
+  gradient. Faint grid lines run through it, and each unit is written only
+  once. The header shows the file name, its folder, and the stream's details
+  as pills. A loudness waveform runs above the spectrogram, and a
+  scanline sweeps across while it is analysed. Hover to get a crosshair
+  that reads out time, frequency and level.
 - **Better pictures.**
+  - The frequency axis is perceptual (mel) by default: chords, melodies and
+    harmonics get room instead of being squeezed into the bottom fifth,
+    and encoder cutoffs still show at the top. Press `y` for Spek's linear
+    axis or a logarithmic one.
+  - Loud components glow softly (bloom). Press `g` to turn it off.
   - Each column averages the power of up to 24 overlapping windowed FFTs
     across its time slice (Welch's method), so noise looks smooth and tones
     look sharp. Spek takes one FFT per window length and averages in dB.
@@ -37,9 +48,9 @@ safe program that draws the best-looking spectrograms around.
   - Sharp, anti-aliased text and lines at any display scale, including
     Retina/HiDPI, using embedded Source Sans 3 outlines.
 
-| Spectrum (Spek's default) | Glacier |
+| Spek's look: Spectrum palette, linear axis, no glow | Glacier palette |
 | --- | --- |
-| ![Spectrum palette](docs/spectrum.png) | ![Glacier palette](docs/glacier.png) |
+| ![The same track with the Spectrum palette and a linear axis](docs/spectrum.png) | ![The same track with the Glacier palette](docs/glacier.png) |
 
 ## Install
 
@@ -88,9 +99,12 @@ On macOS use Cmd instead of Ctrl.
 | `w`, `W` | Change the DFT window size (256 to 16384) |
 | `u`, `U` | Change the upper limit of the dynamic range in dBFS |
 | `l`, `L` | Change the lower limit of the dynamic range in dBFS |
+| `y`, `Y` | Change the frequency scale (mel, linear, logarithmic) |
+| `g` | Turn the glow on or off |
 | `Esc` | Close a panel |
 
-Palette, window function, window size and range are saved in
+Palette, window function, window size, range, frequency scale and glow
+are saved in
 `~/.config/spectro/preferences` (or `$XDG_CONFIG_HOME`, or `%APPDATA%` on
 Windows).
 
@@ -100,8 +114,11 @@ Windows).
 - `Ctrl-E` shows the current settings. Spek's preferences dialog sets the
   language and update checks; spectro is English only and never uses the
   network.
-- Extra: `--output` and the other command-line options, and the three new
-  palettes.
+- The picture is redesigned (see above). For Spek's look, use
+  `-p spectrum --freq-scale linear --glow off`, or press `p`, `y` and `g`.
+- Extra: the hover readout, the loudness waveform, the frequency scales,
+  the glow, three new palettes, and `--output` with the other command-line
+  options.
 
 ## Layout
 
