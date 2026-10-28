@@ -475,41 +475,58 @@ fn blur(buf: &mut [[f32; 3]], tmp: &mut Vec<[f32; 3]>, w: usize, h: usize, r: us
     }
 }
 
-/// For each of `n` pixels along the frequency axis, lowest first: the
-/// fractional band at its centre and the whole bands it spans.
-fn band_rows(n: usize, bands: usize, v: &View) -> Vec<(f32, usize, usize)> {
+/// How one pixel along the frequency axis reads a spectrogram column.
+#[derive(Clone, Copy)]
+enum Band {
+    /// The pixel spans several bands: the loudest wins, so thin tones survive.
+    Max(usize, usize),
+    /// Within one band: Catmull-Rom through four bands, with these weights,
+    /// clamped to the middle two to avoid ringing.
+    Smooth([usize; 4], [f32; 4]),
+}
+
+/// For each of `n` pixels along the frequency axis, lowest first, how it
+/// reads a column.
+fn band_rows(n: usize, bands: usize, v: &View) -> Vec<Band> {
     let (scale, nyquist, lo, hi) = match v.sample_rate {
         0 => (FreqScale::Linear, 1.0, 0.0, 1.0),
         r => (v.freq_scale, r as f64 / 2.0, v.freq_range.0, v.freq_range.1),
     };
-    let band_at = |u: f64| (scale.freq(u, lo, hi) / nyquist * (bands - 1) as f64).clamp(0.0, (bands - 1) as f64) as f32;
+    let last = bands - 1;
+    let band_at = |u: f64| (scale.freq(u, lo, hi) / nyquist * last as f64).clamp(0.0, last as f64) as f32;
     (0..n)
         .map(|k| {
             let bottom = band_at(k as f64 / n as f64);
             let top = band_at((k + 1) as f64 / n as f64);
-            (0.5 * (top + bottom), math::ceilf(bottom) as usize, (math::floorf(top) as usize).min(bands - 1))
+            let (a, b) = (math::ceilf(bottom) as usize, (math::floorf(top) as usize).min(last));
+            if b > a {
+                return Band::Max(a, b);
+            }
+            let mid = 0.5 * (top + bottom);
+            let i = (mid as usize).min(bands - 2);
+            let t = mid - i as f32;
+            let at = |d: isize| (i as isize + d).clamp(0, last as isize) as usize;
+            let (t2, t3) = (t * t, t * t * t);
+            let w = [
+                0.5 * (-t + 2.0 * t2 - t3),
+                0.5 * (2.0 - 5.0 * t2 + 3.0 * t3),
+                0.5 * (t + 4.0 * t2 - 3.0 * t3),
+                0.5 * (-t2 + t3),
+            ];
+            Band::Smooth([at(-1), at(0), at(1), at(2)], w)
         })
         .collect()
 }
 
-/// Level of one pixel's frequency span. A span over several bands takes the
-/// loudest, so thin tones survive; within one band it interpolates smoothly.
-fn band_db(col: &[f32], (mid, lo, hi): (f32, usize, usize)) -> f32 {
-    if hi > lo {
-        return col[lo..=hi].iter().copied().fold(f32::MIN, f32::max);
+/// Level of one pixel's frequency span in a column.
+fn band_db(col: &[f32], band: Band) -> f32 {
+    match band {
+        Band::Max(a, b) => col[a..=b].iter().copied().fold(f32::MIN, f32::max),
+        Band::Smooth(i, w) => {
+            let (a, b, c, d) = (col[i[0]], col[i[1]], col[i[2]], col[i[3]]);
+            (w[0] * a + w[1] * b + w[2] * c + w[3] * d).clamp(b.min(c), b.max(c))
+        }
     }
-    // Catmull-Rom, clamped to its neighbours to avoid ringing.
-    let bands = col.len();
-    let i = (mid as usize).min(bands - 2);
-    let t = mid - i as f32;
-    let g = |k: isize| col[(i as isize + k).clamp(0, bands as isize - 1) as usize];
-    let (a, b, cc, d) = (g(-1), g(0), g(1), g(2));
-    let y = 0.5
-        * (2.0 * b
-            + (cc - a) * t
-            + (2.0 * a - 5.0 * b + 4.0 * cc - d) * t * t
-            + (3.0 * b - a - 3.0 * cc + d) * t * t * t);
-    y.clamp(b.min(cc), b.max(cc))
 }
 
 /// Draws `values` (0 to 1, one per pixel) as a line across the strip `e`,
@@ -534,6 +551,8 @@ fn trace_line(c: &mut Canvas, e: Plot, pad: f32, values: &[f32], color: u32, fil
     }
 }
 
+const GLOW_LUT: usize = 1024;
+
 pub struct Renderer {
     text: Text,
     lut: Lut,
@@ -543,6 +562,11 @@ pub struct Renderer {
     scratch: Vec<[f32; 3]>,
     /// Mean level per frequency pixel of the last picture, for the trace.
     trace: Vec<f32>,
+    /// Each level's contribution to the glow, for the current palette.
+    glow_lut: Vec<[f32; 3]>,
+    /// The dithered background, kept while the size and theme stay.
+    background: Vec<u32>,
+    background_key: (usize, usize, bool),
 }
 
 impl Default for Renderer {
@@ -561,6 +585,9 @@ impl Renderer {
             glow: Vec::new(),
             scratch: Vec::new(),
             trace: Vec::new(),
+            glow_lut: Vec::new(),
+            background: Vec::new(),
+            background_key: (0, 0, false),
         }
     }
 
@@ -568,8 +595,17 @@ impl Renderer {
     /// submarine mode, scrolled to the analysis front.
     fn prepare<'a>(&mut self, v: &View<'a>) -> View<'a> {
         let palette = if v.sonar { Palette::Sonar } else { v.palette };
-        if self.lut.palette() != palette {
+        if self.lut.palette() != palette || self.glow_lut.is_empty() {
             self.lut = Lut::new(palette);
+            // Only the bright parts glow, more so the brighter they are.
+            self.glow_lut = (0..GLOW_LUT)
+                .map(|i| {
+                    let col = self.lut.sample(i as f32 / (GLOW_LUT - 1) as f32);
+                    let lum = (0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]) / 255.0;
+                    let k = ((lum - 0.42) / 0.58).clamp(0.0, 1.0);
+                    col.map(|c| c * 0.25 * k * k)
+                })
+                .collect();
         }
         self.theme = if v.sonar { SONAR } else { STUDIO };
         let (filled, columns) = v.spectrogram.map_or((0, 0), |s| (s.filled(), s.columns()));
@@ -605,12 +641,15 @@ impl Renderer {
         let th = self.theme;
         let l = layout(c.width(), c.height(), v.scale);
         let (cw, ch) = (c.width(), c.height());
-        for y in 0..ch {
-            let bg = background(&th, y, ch);
-            for (x, p) in c.row_mut(y).iter_mut().enumerate() {
-                *p = quantize(bg, x, y);
+        if self.background_key != (cw, ch, v.sonar) || self.background.len() != cw * ch {
+            self.background.clear();
+            for y in 0..ch {
+                let bg = background(&th, y, ch);
+                self.background.extend((0..cw).map(|x| quantize(bg, x, y)));
             }
+            self.background_key = (cw, ch, v.sonar);
         }
+        c.pixels_mut().copy_from_slice(&self.background);
         let bg_at = move |x: usize, y: usize| quantize(background(&th, y, ch), x, y);
 
         self.header(c, &l, v, cw as f32);
@@ -820,30 +859,49 @@ impl Renderer {
             *t /= count.max(1) as f32;
         }
 
-        // Bloom: bright parts, blurred at half resolution, screened back on.
-        let (gw, gh) = (pw.div_ceil(2), ph.div_ceil(2));
+        // Bloom: bright parts, blurred at reduced resolution (half, or a
+        // quarter on a 2x display, which looks the same), screened back on.
+        let f = ((2.0 * l.s + 0.5) as usize).max(2);
+        let (gw, gh) = (pw.div_ceil(f), ph.div_ceil(f));
+        let gain = 4.0 / (f * f) as f32;
         let glow = v.glow && count > 0;
         if glow {
             self.glow.clear();
             self.glow.resize(gw * gh, [0.0; 3]);
             for y in 0..ph {
                 for x in (0..pw).filter(|&x| has(x, y)) {
-                    let col = self.lut.sample(self.levels[y * pw + x]);
-                    let lum = (0.2126 * col[0] + 0.7152 * col[1] + 0.0722 * col[2]) / 255.0;
-                    let k = ((lum - 0.42) / 0.58).clamp(0.0, 1.0);
-                    let k = 0.25 * k * k;
-                    let g = &mut self.glow[(y / 2) * gw + x / 2];
-                    for i in 0..3 {
-                        g[i] += col[i] * k;
+                    let level = self.levels[y * pw + x].clamp(0.0, 1.0);
+                    let add = self.glow_lut[(level * (GLOW_LUT - 1) as f32) as usize];
+                    if add[1] > 0.0 || add[0] > 0.0 || add[2] > 0.0 {
+                        let g = &mut self.glow[(y / f) * gw + x / f];
+                        for i in 0..3 {
+                            g[i] += add[i] * gain;
+                        }
                     }
                 }
             }
-            let r = (3.5 * l.s) as usize + 1;
+            let r = (((7.0 * l.s + 2.0) / f as f32) as usize).max(1);
             blur(&mut self.glow, &mut self.scratch, gw, gh, r);
         }
         let strength = 1.1;
         let well = self.theme.well;
+        // Bilinear sampling of the reduced glow: where each column falls
+        // between glow cells, and each row's vertical blend.
+        let cell = |x: usize, n: usize| {
+            let g = ((x as f32 + 0.5) / f as f32 - 0.5).max(0.0);
+            let i = (g as usize).min(n - 1);
+            (i, (i + 1).min(n - 1), g - i as f32)
+        };
+        let xs: Vec<(usize, usize, f32)> = if glow { (0..pw).map(|x| cell(x, gw)).collect() } else { Vec::new() };
+        let mut row_glow = alloc::vec![[0.0f32; 3]; if glow { gw } else { 0 }];
         for y in 0..ph {
+            if glow {
+                let (iy, jy, fy) = cell(y, gh);
+                for (gx, g) in row_glow.iter_mut().enumerate() {
+                    let (a, b) = (self.glow[iy * gw + gx], self.glow[jy * gw + gx]);
+                    *g = [0, 1, 2].map(|i| ((a[i] + (b[i] - a[i]) * fy) * strength).min(255.0));
+                }
+            }
             let row = c.row_mut(p.y as usize + y);
             for x in 0..pw {
                 let out = &mut row[p.x as usize + x];
@@ -853,19 +911,12 @@ impl Renderer {
                 }
                 let mut col = self.lut.sample(self.levels[y * pw + x]);
                 if glow {
-                    // Bilinear sample of the half-resolution glow.
-                    let gx = ((x as f32 - 0.5) / 2.0).max(0.0);
-                    let gy = ((y as f32 - 0.5) / 2.0).max(0.0);
-                    let (ix, iy) = ((gx as usize).min(gw - 1), (gy as usize).min(gh - 1));
-                    let (jx, jy) = ((ix + 1).min(gw - 1), (iy + 1).min(gh - 1));
-                    let (fx, fy) = (gx - ix as f32, gy - iy as f32);
-                    let (g00, g10) = (self.glow[iy * gw + ix], self.glow[iy * gw + jx]);
-                    let (g01, g11) = (self.glow[jy * gw + ix], self.glow[jy * gw + jx]);
+                    let (ix, jx, fx) = xs[x];
+                    let (a, b) = (row_glow[ix], row_glow[jx]);
                     for (i, ci) in col.iter_mut().enumerate() {
-                        let a = g00[i] * (1.0 - fx) + g10[i] * fx;
-                        let b = g01[i] * (1.0 - fx) + g11[i] * fx;
-                        let g = ((a * (1.0 - fy) + b * fy) * strength).min(255.0);
-                        *ci = 255.0 - (255.0 - *ci) * (255.0 - g) / 255.0;
+                        let g = a[i] + (b[i] - a[i]) * fx;
+                        // Screen blend.
+                        *ci = 255.0 - (255.0 - *ci) * (255.0 - g) * (1.0 / 255.0);
                     }
                 }
                 *out = quantize(col, x, y);

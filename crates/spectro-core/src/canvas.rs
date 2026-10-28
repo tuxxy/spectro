@@ -42,6 +42,10 @@ impl Canvas {
         &self.pixels
     }
 
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
+        &mut self.pixels
+    }
+
     pub fn into_pixels(self) -> Vec<u32> {
         self.pixels
     }
@@ -96,7 +100,9 @@ fn rounded_distance(px: f32, py: f32, x: f32, y: f32, w: f32, h: f32, r: f32) ->
     let qx = (px - (x + hw)).abs() - (hw - r);
     let qy = (py - (y + hh)).abs() - (hh - r);
     let (ox, oy) = (qx.max(0.0), qy.max(0.0));
-    crate::math::sqrt((ox * ox + oy * oy) as f64) as f32 + qx.max(qy).min(0.0) - r
+    // Only the corners need the square root.
+    let outside = if ox == 0.0 || oy == 0.0 { ox + oy } else { crate::math::sqrt((ox * ox + oy * oy) as f64) as f32 };
+    outside + qx.max(qy).min(0.0) - r
 }
 
 /// A rounded rectangle in device pixels, possibly fractional.
@@ -141,8 +147,14 @@ impl Canvas {
     /// Strokes the inside edge of a rounded rectangle, `t` pixels wide.
     pub fn stroke_round(&mut self, rr: RoundRect, t: f32, color: u32, alpha: f32) {
         let (x0, y0, x1, y1) = rr.bounds(1.0, self);
+        // Pixels further than this from every edge are untouched.
+        let m = crate::math::ceilf(rr.r + t) as usize + 2;
         for y in y0..y1 {
+            let middle = y >= y0 + m && y + m < y1;
             for x in x0..x1 {
+                if middle && x >= x0 + m && x + m < x1 {
+                    continue;
+                }
                 let d = rr.distance(x as f32 + 0.5, y as f32 + 0.5);
                 let cov = (t * 0.5 + 0.5 - (d + t * 0.5).abs()).clamp(0.0, 1.0);
                 if cov > 0.0 {
